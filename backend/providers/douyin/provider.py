@@ -1,0 +1,611 @@
+import asyncio
+import logging
+import random
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
+from urllib.parse import quote, unquote, urlsplit
+
+from playwright.async_api import Error, Page
+from playwright.async_api import TimeoutError as BrowserTimeout
+from pydantic import HttpUrl, ValidationError
+
+from backend.providers.base import (
+    NetworkError,
+    ProviderError,
+    ProviderTimeoutError,
+    SearchProvider,
+    SelectorChangedError,
+    UserActionRequired,
+)
+from backend.providers.douyin.parser import (
+    apply_search_filters_and_sorting,
+    extract_douyin_ssr_json,
+    parse_count_text,
+    parse_detail,
+    parse_search_response_json,
+    validate_image_url,
+    video_url,
+)
+from backend.schemas.contracts import SearchFilters, VideoResult
+from backend.services.douyin_browser_service import MESSAGES, DouyinBrowserService
+from backend.services.media_parser import extract_hashtags, parse_duration_seconds
+
+logger = logging.getLogger(__name__)
+
+
+
+DETAIL_SCRIPT = """() => {
+  const video = document.querySelector('video');
+  const meta = (name) => document.querySelector(`meta[property="${name}"],meta[name="${name}"]`)?.content || null;
+
+  const titleEl = document.querySelector('[data-e2e="video-desc"], h1, .title, [class*="video-info-detail"]');
+  const descEl = document.querySelector('[data-e2e="video-desc"], .desc, .caption');
+
+  const authorNameEl = document.querySelector('[data-e2e="video-author-name"], .author-name, .account-name, .author-info .name, a[href*="/user/"] span');
+  const authorLinkEl = document.querySelector('a[href*="/user/"], [data-e2e="video-author-avatar"] a');
+
+  const likeEl = document.querySelector('[data-e2e="like-count"], [data-e2e="video-player-digg"] span, [class*="like"] .count, [class*="digg"] .count');
+  const commentEl = document.querySelector('[data-e2e="comment-count"], [class*="comment"] .count');
+  const favoriteEl = document.querySelector('[data-e2e="favorite-count"], [class*="favorite"] .count, [class*="collect"] .count');
+  const shareEl = document.querySelector('[data-e2e="share-count"], [class*="share"] .count');
+
+  const hashtags = Array.from(document.querySelectorAll('a[href*="/hashtag/"], a[href*="/tag/"], [data-e2e="video-desc"] a'))
+    .map(el => el.innerText.trim())
+    .filter(text => text.startsWith('#') || text.length > 0);
+
+  const durationSeconds = video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
+  const caption = descEl ? descEl.innerText.trim() : null;
+  const likeText = likeEl ? likeEl.innerText.trim() : null;
+  const commentText = commentEl ? commentEl.innerText.trim() : null;
+  const favoriteText = favoriteEl ? favoriteEl.innerText.trim() : null;
+  const shareText = shareEl ? shareEl.innerText.trim() : null;
+  const poster = meta('og:image') || (video && video.poster ? video.poster : null);
+
+  return {
+    has_video: Boolean(video),
+    title: titleEl ? titleEl.innerText.trim() : null,
+    caption: caption,
+    description: caption,
+    author_name: authorNameEl ? authorNameEl.innerText.trim() : null,
+    author_url: authorLinkEl ? authorLinkEl.href : null,
+    like_count: likeText,
+    like_text: likeText,
+    comment_count: commentText,
+    comment_text: commentText,
+    favorite_count: favoriteText,
+    collect_text: favoriteText,
+    share_count: shareText,
+    share_text: shareText,
+    duration_seconds: durationSeconds,
+    duration: durationSeconds,
+    thumbnail_url: poster,
+    poster: poster,
+    hashtags: hashtags,
+    keywords: [],
+    published_at: null,
+  };
+}"""
+
+
+class DouyinProvider(SearchProvider):
+    capture_origin = "live_provider"
+
+    def __init__(self, browser: DouyinBrowserService, auto_elevate: bool = False):
+        self.browser = browser
+        self.auto_elevate = auto_elevate
+
+    async def close(self) -> None:
+        if hasattr(self.browser, "release_blocked_page"):
+            await self.browser.release_blocked_page()
+
+    async def gate(self, page: Page, partial: list[VideoResult] | None = None) -> None:
+        state = await self.browser.inspect(page)
+        if state in {"login_required", "verification_required", "restricted"}:
+            if state in {"login_required", "verification_required"}:
+                if self.auto_elevate and getattr(self.browser, "is_currently_headless", False):
+                    try:
+                        await self.browser.elevate_to_headful(persist=False)
+                    except Exception:
+                        pass
+            raise UserActionRequired(
+                "waiting_for_login" if state == "login_required" else "waiting_for_user",
+                MESSAGES[state],
+                partial=partial,
+            )
+        if state == "closed":
+            raise UserActionRequired("waiting_for_user", MESSAGES[state], partial=partial)
+        if state == "network_error":
+            raise NetworkError(MESSAGES[state])
+
+    async def search(
+        self,
+        query: str,
+        limit: int,
+        filters: SearchFilters,
+        on_batch: Callable[[list[VideoResult]], Awaitable[None]] | None = None,
+    ) -> list[VideoResult]:
+        # Searches always run headless, even when auto-elevation is enabled for
+        # challenges: drop any visible window before acquiring the lock.
+        if hasattr(self.browser, "ensure_headless_session"):
+            await self.browser.ensure_headless_session()
+        elif hasattr(self.browser, "reset_headful_session"):
+            self.browser.reset_headful_session()
+        async with self.browser.lock:
+            if hasattr(self.browser, "release_blocked_page"):
+                await self.browser.release_blocked_page()
+            results: list[VideoResult] = []
+            page: Page | None = None
+            on_response_cb: Any = None
+            try:
+                base = getattr(self.browser, "base_url", "https://www.douyin.com")
+                query_params: dict[str, str] = {}
+                if filters.content_type == "video":
+                    query_params["type"] = "video"
+                else:
+                    query_params["type"] = "general"
+
+                if filters.sort_by == "most_liked":
+                    query_params["sort_type"] = "1"
+                elif filters.sort_by == "newest":
+                    query_params["sort_type"] = "2"
+
+                if filters.publish_time == "day":
+                    query_params["publish_time"] = "1"
+                elif filters.publish_time == "week":
+                    query_params["publish_time"] = "7"
+                elif filters.publish_time == "six_months":
+                    query_params["publish_time"] = "180"
+
+                param_str = "&".join(f"{k}={v}" for k, v in query_params.items())
+                direct_url = f"{base}/search/{quote(query)}?{param_str}"
+                # 1. Ensure page is open WITHOUT navigating to search URL before listener is attached
+                try:
+                    page = await self.browser.ensure_open(
+                        headless_override=True if not self.auto_elevate else None,
+                    )
+                except TypeError:
+                    page = await self.browser.ensure_open()
+
+                intercepted_results: list[VideoResult] = []
+                seen_api_ids: set[str] = set()
+                response_received = asyncio.Event()
+
+                async def handle_response(response: Any) -> None:
+                    try:
+                        resp_url = getattr(response, "url", "") or ""
+                        if (
+                            "aweme/v1/web/search/item" in resp_url
+                            or "aweme/v1/web/general/search/single" in resp_url
+                        ) and getattr(response, "status", 0) == 200:
+                            data = await response.json()
+                            items = parse_search_response_json(data, limit=limit, filters=filters)
+                            for it in items:
+                                if it.platform_video_id and it.platform_video_id not in seen_api_ids:
+                                    seen_api_ids.add(it.platform_video_id)
+                                    intercepted_results.append(it)
+                            if intercepted_results:
+                                response_received.set()
+                    except Exception as exc:
+                        logger.debug("Intercepted response parse error: %s", exc)
+
+                # 2. Attach response listener BEFORE initiating navigation
+                if hasattr(page, "on"):
+                    page.on("response", handle_response)
+                    on_response_cb = handle_response
+
+                # Pre-check gate only if already restricted or verification required
+                initial_state = await self.browser.inspect(page)
+                if initial_state in {"verification_required", "restricted"}:
+                    await self.gate(page, results)
+
+                # 3. Always navigate to direct_url so listener captures search response in-flight
+                if getattr(page, "url", "") != direct_url:
+                    await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+                else:
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+
+                # 4. Wait briefly for intercepted network response or waterfall selector
+                try:
+                    await asyncio.wait_for(response_received.wait(), timeout=3.5)
+                except TimeoutError:
+                    pass
+
+                try:
+                    await page.wait_for_selector(
+                        'a[href*="/video/"], a[href*="/note/"], [id^="waterfall_item_"]',
+                        timeout=5000,
+                    )
+                except Error:
+                    await page.wait_for_timeout(1000)
+                await self.gate(page, results)
+
+                # 5. Early return if intercepted results satisfy quota
+                if len(intercepted_results) >= limit:
+                    if hasattr(page, "remove_listener"):
+                        try:
+                            page.remove_listener("response", handle_response)
+                        except Exception:
+                            pass
+                    results = apply_search_filters_and_sorting(intercepted_results, filters=filters, limit=limit)
+                    if on_batch:
+                        await on_batch(results)
+                    return results
+
+                # Detach response listener once initial network interception window concludes
+                if hasattr(page, "remove_listener"):
+                    try:
+                        page.remove_listener("response", handle_response)
+                    except Exception:
+                        pass
+
+                current_url = urlsplit(page.url)
+                unquoted_path = unquote(current_url.path)
+                on_search_page = unquoted_path.startswith("/search")
+                if not on_search_page:
+                    raise SelectorChangedError(
+                        "Trang tìm kiếm Douyin bị chuyển hướng khỏi kết quả tìm kiếm. Dừng để không lưu nhầm video đề xuất."
+                    )
+                path_parts = unquoted_path.strip("/").split("/")
+                if len(path_parts) >= 2 and path_parts[0] == "search":
+                    current_kw = path_parts[1].split("?")[0].strip().lower()
+                    expected_kw = query.strip().lower()
+                    if current_kw != expected_kw:
+                        raise SelectorChangedError(
+                            f"Trang tìm kiếm Douyin bị chuyển hướng sang từ khóa khác ({current_kw!r} != {expected_kw!r}). Dừng để không lưu nhầm kết quả."
+                        )
+
+                # Tier 2: Extract from SSR script data if available
+                try:
+                    content = await page.content()
+                    ssr_dict = extract_douyin_ssr_json(content)
+                    if ssr_dict:
+                        ssr_items = parse_search_response_json(ssr_dict, limit=limit, filters=filters)
+                        for it in ssr_items:
+                            if it.platform_video_id and it.platform_video_id not in seen_api_ids:
+                                seen_api_ids.add(it.platform_video_id)
+                                intercepted_results.append(it)
+                        if len(intercepted_results) >= limit:
+                            if hasattr(page, "remove_listener"):
+                                try:
+                                    page.remove_listener("response", handle_response)
+                                except Exception:
+                                    pass
+                            results = apply_search_filters_and_sorting(intercepted_results, filters=filters, limit=limit)
+                            if on_batch:
+                                await on_batch(results)
+                            return results
+                except Exception:
+                    pass
+
+                candidates: dict[str, dict[str, Any]] = {}
+                max_scrolls = min(max(10, int(limit * 1.5)), 120)
+                target_candidates = max(int(limit * 1.5), limit + 10)
+                prev_count = 0
+                stale_scrolls = 0
+
+                for _ in range(max_scrolls):
+                    await self.gate(page, results)
+                    if len(intercepted_results) >= limit:
+                        if hasattr(page, "remove_listener"):
+                            try:
+                                page.remove_listener("response", handle_response)
+                            except Exception:
+                                pass
+                        results = apply_search_filters_and_sorting(intercepted_results, filters=filters, limit=limit)
+                        if on_batch:
+                            await on_batch(results)
+                        return results
+
+                    items = await page.locator(
+                        'a[href*="/video/"], a[href*="/note/"], [id^="waterfall_item_"] a'
+                    ).evaluate_all(
+                        """els => {
+                            const res = [];
+                            for (const e of els) {
+                                const card = e.closest('li, [data-e2e*="card"], [class*="search-result-card"], [class*="search-card"], [class*="card"], [class*="item"], [class*="search-result"]') || e.parentElement;
+                                if (!card) continue;
+                                if (card.closest('.guess-words, [data-e2e="search_guess_words"], [class*="recommend"], [class*="hot-search"], [class*="ad-"], [class*="billboard"], [class*="related-search"]')) continue;
+                                if (
+                                    card.querySelector('[class*="live"], [class*="living"], .living, [data-e2e*="live"]') ||
+                                    card.innerText.includes('直播中') ||
+                                    card.innerText.includes('进入直播') ||
+                                    card.querySelector('a[href*="/live/"]') ||
+                                    (e.href && e.href.includes('/live/'))
+                                ) {
+                                    continue;
+                                }
+                                const isNote = Boolean(
+                                    card.innerText.includes('图文') ||
+                                    (e.href && e.href.includes('/note/')) ||
+                                    card.querySelector('[class*="note"], [class*="image-tag"]')
+                                );
+                                const img = card ? (card.querySelector('img') || e.querySelector('img')) : e.querySelector('img');
+                                const cover = img ? (img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-origin')) : null;
+                                
+                                // Title extraction: prioritize img.alt, then title/aria-label, then inner text elements
+                                let title = img ? (img.getAttribute('alt') || '').trim() : '';
+                                if (!title || title.length < 2) {
+                                    title = (e.getAttribute('title') || card.getAttribute('title') || e.getAttribute('aria-label') || '').trim();
+                                }
+                                if (!title || title.length < 2) {
+                                    const titleEl = card.querySelector('[data-e2e*="desc"], [class*="title-text"], [class*="title"], [class*="desc"], [class*="caption"], [class*="info"] p, p, h3, h4');
+                                    if (titleEl && titleEl.innerText) {
+                                        title = titleEl.innerText.trim();
+                                    }
+                                }
+                                if (!title || title.length < 2) {
+                                    const rawText = (card.innerText || '').trim();
+                                    const lines = rawText.split('\\n').map(l => l.trim()).filter(l => l.length > 2 && !/^\\d+(\\.\\d+)?[wkW万千]?$/.test(l));
+                                    if (lines.length > 0) {
+                                        title = lines[0];
+                                    }
+                                }
+
+                                const author = card ? (card.querySelector('[data-e2e*="author"], [class*="author"], [class*="account"], [class*="user-name"], [class*="name"] a, a[href*="/user/"]')?.innerText?.trim() || null) : null;
+                                const authorLink = card ? (card.querySelector('a[href*="/user/"]')?.href || null) : null;
+                                const likeText = card ? (card.querySelector('[data-e2e*="like"], [class*="like"], [class*="digg"], [class*="count"]')?.innerText?.trim() || null) : null;
+                                const durationEl = card ? (
+                                    card.querySelector('[class*="duration"], [class*="time-tag"], [class*="time_tag"], span.time') ||
+                                    Array.from(card.querySelectorAll('span, div')).find(s => /^\\d{1,2}:\\d{2}(:\\d{2})?$/.test(s.innerText ? s.innerText.trim() : ''))
+                                ) : null;
+                                const durationText = durationEl ? durationEl.innerText.trim() : null;
+
+                                const tagEls = Array.from(card.querySelectorAll('a[href*="/hashtag/"], a[href*="/tag/"], [class*="tag"], [data-e2e*="tag"]'));
+                                const cardTags = tagEls.map(t => (t.innerText || '').trim().replace(/^#/, '')).filter(t => t.length > 0);
+                                const rawCardTags = (card.innerText || '').match(/#([^\\s#]+)/g) || [];
+                                for (const rh of rawCardTags) {
+                                    const cleanRh = rh.replace(/^#/, '').trim();
+                                    if (cleanRh && !cardTags.includes(cleanRh)) {
+                                        cardTags.push(cleanRh);
+                                    }
+                                }
+
+                                res.push({
+                                    href: e.href,
+                                    cover: cover,
+                                    title: title || null,
+                                    author: author,
+                                    author_link: authorLink,
+                                    like_text: likeText,
+                                    duration_text: durationText,
+                                    is_note: isNote,
+                                    hashtags: cardTags,
+                                });
+                            }
+                            return res;
+                        }"""
+                    )
+                    for item in items:
+                        link = item.get("href")
+                        if not link:
+                            continue
+                        canonical = video_url(link)
+                        if canonical:
+                            vid_id = canonical.rsplit("/", 1)[1]
+                            cover = item.get("cover")
+                            is_note = bool(item.get("is_note"))
+                            if vid_id not in candidates or (cover and not candidates[vid_id].get("cover")):
+                                candidates[vid_id] = {
+                                    "link": canonical,
+                                    "cover": cover,
+                                    "title": item.get("title"),
+                                    "author": item.get("author"),
+                                    "author_link": item.get("author_link"),
+                                    "like_text": item.get("like_text"),
+                                    "duration_text": item.get("duration_text"),
+                                    "is_note": is_note,
+                                    "hashtags": item.get("hashtags") or [],
+                                }
+                    video_count = sum(1 for c in candidates.values() if c.get("title"))
+                    if (len(intercepted_results) + video_count) >= limit or len(candidates) >= target_candidates:
+                        break
+
+                    # Auto dismiss any guest / login modal on scroll
+                    try:
+                        modal = page.locator(
+                            ".dy-account-close:visible, [data-e2e='modal-close-icon']:visible, [class*='login-mask'] [class*='close']:visible, [aria-label='关闭']:visible"
+                        ).first
+                        if await modal.count() > 0:
+                            await modal.click(timeout=800)
+                        await page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+
+                    scroll_px = random.randint(800, 1150)
+                    await page.mouse.wheel(0, scroll_px)
+                    await page.wait_for_timeout(random.randint(150, 300))
+
+                    if len(candidates) == prev_count:
+                        stale_scrolls += 1
+                        if stale_scrolls in (2, 3):
+                            try:
+                                await page.keyboard.press("PageDown")
+                                await page.wait_for_timeout(300)
+                            except Exception:
+                                pass
+                        if stale_scrolls >= 4 and prev_count > 0:
+                            break
+                        elif stale_scrolls >= 6:
+                            break
+                    else:
+                        stale_scrolls = 0
+                        prev_count = len(candidates)
+
+                # Seed results from network interception first
+                for it in intercepted_results:
+                    if len(results) < limit and not any(r.platform_video_id == it.platform_video_id for r in results):
+                        results.append(it)
+                        if on_batch:
+                            await on_batch([it])
+
+                if len(results) >= limit:
+                    if hasattr(page, "remove_listener"):
+                        try:
+                            page.remove_listener("response", handle_response)
+                        except Exception:
+                            pass
+                    return apply_search_filters_and_sorting(results, filters=filters, limit=limit)
+
+                if not candidates and not results:
+                    # An empty shell (infinite skeleton, no anchors/API/SSR) on an
+                    # unauthenticated session is a login problem, not a structure
+                    # change: route to manual re-login so the session refreshes and
+                    # the search resumes. Without inspect diagnostics, keep legacy.
+                    diag = getattr(self.browser, "diagnostics", None)
+                    if isinstance(diag, dict) and not diag.get("is_authenticated", False):
+                        if self.auto_elevate and getattr(self.browser, "is_currently_headless", False):
+                            try:
+                                await self.browser.elevate_to_headful(persist=False)
+                            except Exception:
+                                pass
+                        raise UserActionRequired("waiting_for_login", MESSAGES["login_required"])
+                    raise SelectorChangedError(
+                        "Trang Douyin chưa có liên kết video để đọc; có thể không có kết quả hoặc cấu trúc trang đã đổi."
+                    )
+
+                needs_detail: list[tuple[str, dict[str, Any]]] = []
+                for vid_id, cand in list(candidates.items()):
+                    if any(r.platform_video_id == vid_id for r in results):
+                        continue
+                    is_note = bool(cand.get("is_note"))
+                    if filters.content_type == "video" and is_note:
+                        continue
+                    if filters.content_type == "image_text" and not is_note:
+                        continue
+                    canonical = str(cand["link"])
+                    candidate_cover = cand.get("cover")
+                    title = cand.get("title")
+                    if title:
+                        card_likes = parse_count_text(str(cand.get("like_text"))) if cand.get("like_text") else None
+                        if card_likes is None or card_likes >= filters.minimum_likes:
+                            duration_sec = parse_duration_seconds(cand.get("duration_text")) if not is_note else None
+                            tags = extract_hashtags(str(title))
+                            raw_cand_tags = cand.get("hashtags")
+                            cand_tags = raw_cand_tags if isinstance(raw_cand_tags, list) else []
+                            for ct in cand_tags:
+                                clean_ct = str(ct).strip().lstrip("#")
+                                if clean_ct and clean_ct not in tags:
+                                    tags.append(clean_ct)
+                            vr = VideoResult(
+                                platform="douyin",
+                                platform_video_id=vid_id,
+                                url=cast(HttpUrl, canonical),
+                                share_url=canonical,
+                                title=str(title)[:500],
+                                thumbnail_url=validate_image_url(str(candidate_cover)) if candidate_cover else None,
+                                author_name=str(cand.get("author"))[:100] if cand.get("author") else None,
+                                author_url=str(cand.get("author_link")) if cand.get("author_link") else None,
+                                like_count=card_likes,
+                                duration_seconds=duration_sec,
+                                hashtags=tags,
+                                media_type="image_text" if is_note else "video",
+                                is_mock=False,
+                            )
+                            results.append(vr)
+                            if on_batch:
+                                await on_batch([vr])
+                            if len(results) >= limit:
+                                break
+                    else:
+                        needs_detail.append((vid_id, cand))
+
+                if len(results) < limit and needs_detail:
+                    assert self.browser.context is not None
+                    detail = await self.browser.context.new_page()
+                    should_close_detail = True
+                    try:
+                        remaining_needed = max(0, limit - len(results))
+                        detail_budget = min(len(needs_detail), max(6, remaining_needed * 3), 20)
+                        for vid_id, cand in needs_detail[:detail_budget]:
+                            if len(results) >= limit:
+                                break
+                            link = str(cand["link"])
+                            candidate_cover = cand.get("cover")
+                            try:
+                                await detail.goto(link, wait_until="domcontentloaded", timeout=4000)
+                                await self.gate(detail, results)
+                                try:
+                                    await detail.wait_for_selector(
+                                        "video, [data-e2e='video-desc'], .video-info-detail",
+                                        timeout=1500,
+                                    )
+                                except Error:
+                                    pass
+
+                                try:
+                                    await detail.locator("video").evaluate_all(
+                                        "els => els.forEach(v => v.pause())"
+                                    )
+                                except Error:
+                                    pass
+
+                                actual_canonical = video_url(detail.url)
+                                actual_id = actual_canonical.rsplit("/", 1)[1] if actual_canonical else None
+                                effective_link = actual_canonical or detail.url
+                                effective_id = actual_id or vid_id
+
+                                raw_data = await detail.evaluate(DETAIL_SCRIPT)
+                                try:
+                                    result = parse_detail(
+                                        raw_data,
+                                        effective_link,
+                                        candidate_cover=candidate_cover,
+                                        share_url=effective_link,
+                                        platform_video_id=effective_id,
+                                    )
+                                    if result:
+                                        if (result.like_count or 0) >= filters.minimum_likes:
+                                            results.append(result)
+                                            if on_batch:
+                                                await on_batch([result])
+                                            if len(results) >= limit:
+                                                break
+                                except ValidationError as e:
+                                    logger.warning(
+                                        "Validation failed for Douyin candidate %s: %s",
+                                        effective_id,
+                                        e,
+                                    )
+                                    continue
+
+                            except UserActionRequired:
+                                should_close_detail = False
+                                if hasattr(self.browser, "blocked_page"):
+                                    self.browser.blocked_page = detail
+                                if hasattr(self.browser, "search_page"):
+                                    self.browser.search_page = getattr(self.browser, "page", None)
+                                if hasattr(self.browser, "page"):
+                                    self.browser.page = detail
+                                raise
+                            except (ProviderError, asyncio.CancelledError):
+                                raise
+                            except Exception:
+                                pass
+                    finally:
+                        if should_close_detail:
+                            if hasattr(self.browser, "search_page") and getattr(self.browser, "search_page", None):
+                                self.browser.page = self.browser.search_page
+                            if hasattr(self.browser, "blocked_page"):
+                                self.browser.blocked_page = None
+                            await detail.close()
+
+                if not results:
+                    raise SelectorChangedError(
+                        "Chưa xác minh được video Douyin trong các bài đã mở. Không tạo kết quả thay thế."
+                    )
+                return apply_search_filters_and_sorting(results, filters=filters, limit=limit)
+            except BrowserTimeout:
+                raise ProviderTimeoutError("Douyin phản hồi quá chậm. Thử lại sau.") from None
+            except Error:
+                raise NetworkError(
+                    "Trình duyệt Douyin đã đóng hoặc mất kết nối. Mở lại từ Cài đặt hoặc Giao diện tìm kiếm."
+                ) from None
+            finally:
+                if on_response_cb and page and hasattr(page, "remove_listener"):
+                    try:
+                        page.remove_listener("response", on_response_cb)
+                    except Exception:
+                        pass

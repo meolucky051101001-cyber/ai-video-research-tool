@@ -1,0 +1,833 @@
+import asyncio
+import json
+import logging
+import time
+import re
+from pathlib import Path
+from typing import Any, cast
+from urllib.parse import parse_qs, urlsplit
+
+from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
+from playwright.async_api import TimeoutError as BrowserTimeout
+
+from backend.core.config import ROOT, settings
+from backend.providers.base import ProviderUnavailableError
+from backend.providers.douyin.parser import classify_page
+from backend.services.browser_session import (
+    checkpoint_has_session_cookie,
+    cleanup_stale_profile_locks,
+    load_headful_preference,
+    platform_navigation_url,
+    restore_missing_cookies,
+    save_headful_preference,
+    save_session_checkpoint,
+    visible_challenge_evidence,
+)
+
+logger = logging.getLogger("douyin.browser")
+
+DOUYIN_HOME = "https://www.douyin.com"
+MESSAGES = {
+    "authenticated": "Đã đăng nhập Douyin. Có thể bắt đầu tìm kiếm.",
+    "closed": "Trình duyệt Douyin chưa mở.",
+    "page_available": "Trang Douyin đã mở. Sẵn sàng tìm kiếm.",
+    "login_required": "Douyin yêu cầu đăng nhập tài khoản. Hãy bấm vào đường link bên cạnh để đăng nhập trên trình duyệt, rồi bấm Tiếp tục lượt tìm.",
+    "verification_required": "Douyin yêu cầu xác minh bảo mật. Hãy mở liên kết để hoàn tất xác minh, rồi bấm Tiếp tục lượt tìm.",
+    "restricted": "Douyin đang hạn chế truy cập / IP hoặc hệ thống bận. Lượt tìm đã dừng; thử lại sau.",
+    "network_error": "Không kết nối được tới Douyin. Vui lòng kiểm tra kết nối mạng.",
+    "busy": "Trình duyệt Douyin đang xử lý lượt tìm.",
+}
+HEAVY_EXTENSIONS = (
+    ".mp4",
+    ".m4s",
+    ".m3u8",
+    ".ts",
+    ".webm",
+    ".flv",
+    ".avi",
+    ".woff",
+    ".woff2",
+    ".ttf",
+)
+
+
+async def has_usable_douyin_document(page: Page) -> bool:
+    """A navigation timeout is recoverable only after real Douyin DOM is visible."""
+    try:
+        host = (urlsplit(page.url).hostname or "").lower()
+        if host != "douyin.com" and not host.endswith(".douyin.com"):
+            return False
+        return bool(await page.evaluate("Boolean(document.body && document.body.childElementCount > 0)"))
+    except (Error, AttributeError, TypeError, ValueError):
+        return False
+
+
+class DouyinBrowserService:
+    def __init__(self, profile: Path | None = None, headless: bool = True, hybrid_headless: bool = True):
+        self.profile = profile or ROOT / "data/browser/douyin"
+        self.headless = headless
+        self.hybrid_headless = hybrid_headless
+        self.default_hybrid_headless = hybrid_headless
+        self.force_headful_session = False
+        self.sticky_headful = load_headful_preference(self.profile)
+        self.is_currently_headless = headless
+        self.driver: Playwright | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
+        self.search_page: Page | None = None
+        self.blocked_page: Page | None = None
+        self.lock = asyncio.Lock()
+        self.state = "closed"
+        self.base_url = DOUYIN_HOME
+        self.diagnostics: dict = {}
+        self.allow_media = False
+        self.dismiss_guest_modal = True
+        self.last_http_status: int | None = None
+        self._last_checkpoint: float = 0.0
+
+    def set_allow_media(self, allow: bool) -> None:
+        self.allow_media = allow
+
+    def should_block_resource(self, url: str, resource_type: str) -> bool:
+        # A visible verification window must load every challenge resource.
+        if not self.is_currently_headless or self.state == "verification_required":
+            return False
+        lowered = url.lower()
+        host = (urlsplit(lowered).hostname or "").lower()
+        trackers = ("sensorsdata.cn", "growingio.com", "hm.baidu.com", "google-analytics.com")
+        if any(host == domain or host.endswith("." + domain) for domain in trackers):
+            return True
+        if self.allow_media:
+            return resource_type == "font"
+        return resource_type in {"media", "font"} or any(
+            lowered.endswith(ext) or ext + "?" in lowered for ext in HEAVY_EXTENSIONS
+        )
+
+    def should_run_headless(self) -> bool:
+        if getattr(self, "force_headful_session", False):
+            return False
+        if getattr(self, "sticky_headful", False):
+            return False
+        if not getattr(self, "hybrid_headless", True):
+            return False
+        if self.headless:
+            return True
+        auth_file = self.profile / "auth_state.json"
+        if auth_file.exists():
+            try:
+                data = json.loads(auth_file.read_text("utf-8"))
+                # Only a real login session cookie justifies a headless launch;
+                # a pile of anonymous cookies would hit the login wall.
+                if checkpoint_has_session_cookie(data):
+                    return True
+            except Exception:
+                logger.debug("Could not evaluate Douyin checkpoint for headless mode")
+        return False
+
+    def reset_headful_session(self, force: bool = False) -> None:
+        if force or not getattr(self, "sticky_headful", False):
+            self.force_headful_session = False
+            self.sticky_headful = False
+            self.hybrid_headless = getattr(self, "default_hybrid_headless", True)
+
+    async def ensure_headless_session(self) -> None:
+        # Searches always run headless: drop any elevation leftover, including a
+        # manually opened window. The open context is checkpointed by _close, so
+        # the solved session survives and the search relaunches headless. The
+        # persisted prefer_headful file is left alone for manual windows.
+        self.reset_headful_session(force=True)
+        if getattr(self, "is_currently_headless", True) is False and self.context:
+            await self._close()
+
+    async def elevate_to_headful(self, persist: bool = True) -> Page:
+        self.force_headful_session = True
+        self.hybrid_headless = False
+        if persist:
+            self.sticky_headful = True
+            save_headful_preference(self.profile)
+        if not getattr(self, "is_currently_headless", False):
+            try:
+                return self.get_active_page()
+            except ProviderUnavailableError:
+                return await self._ensure_open_unlocked(headless_override=False)
+        try:
+            active = self.get_active_page()
+            current_url = platform_navigation_url(active.url, ("douyin.com",))
+        except ProviderUnavailableError:
+            current_url = None
+        await self._close()
+        # Navigate directly to the blocked route, never via the home feed.
+        page = await self._ensure_open_unlocked(headless_override=False, initial_url=current_url)
+        await self.inspect(page)
+        return page
+
+    def get_active_page(self) -> Page:
+        if self.blocked_page and not self.blocked_page.is_closed():
+            return self.blocked_page
+        if self.page and not self.page.is_closed():
+            return self.page
+        raise ProviderUnavailableError("Trình duyệt Douyin chưa mở.")
+
+    async def release_blocked_page(self) -> None:
+        if self.blocked_page:
+            try:
+                if not self.blocked_page.is_closed():
+                    await self.blocked_page.close()
+            except Exception:
+                pass
+            self.blocked_page = None
+        if self.search_page and not self.search_page.is_closed():
+            self.page = self.search_page
+
+    def snapshot(self) -> dict:
+        active = None
+        try:
+            active = self.get_active_page()
+        except Exception:
+            pass
+        if active is None and (self.page is None or self.page.is_closed()):
+            self.state = "closed"
+            self.diagnostics = {}
+        login_url = self.base_url or "https://www.douyin.com"
+        return {
+            "state": self.state,
+            "message": MESSAGES.get(self.state, "Trạng thái trình duyệt Douyin không xác định."),
+            "profile_location": str(self.profile),
+            "base_url": self.base_url,
+            "login_url": login_url,
+            "open": active is not None,
+            "busy": self.lock.locked(),
+            "diagnostics": self.diagnostics,
+            "active_url": active.url if active else None,
+            "is_blocked_tab": bool(self.blocked_page and not self.blocked_page.is_closed()),
+        }
+
+    async def ensure_open(
+        self,
+        headless_override: bool | None = None,
+        initial_url: str | None = None,
+    ) -> Page:
+        """Open the browser, serialized by self.lock.
+
+        Callers that already hold self.lock (providers inside a search) skip
+        the re-acquire: asyncio.Lock is not reentrant and a nested acquire
+        would deadlock. Mutual exclusion makes locked() == True proof that the
+        CURRENT caller owns the lock.
+        """
+        if self.lock.locked():
+            return await self._ensure_open_unlocked(
+                headless_override=headless_override, initial_url=initial_url
+            )
+        async with self.lock:
+            return await self._ensure_open_unlocked(
+                headless_override=headless_override, initial_url=initial_url
+            )
+
+    async def _ensure_open_unlocked(
+        self, headless_override: bool | None = None, initial_url: str | None = None
+    ) -> Page:
+        if self.page and not self.page.is_closed():
+            return self.page
+        await self._close()
+        self.profile.mkdir(parents=True, exist_ok=True)
+        removed_locks = cleanup_stale_profile_locks(self.profile)
+        if removed_locks:
+            logger.info("Removed stale Douyin profile locks: %s", ", ".join(sorted(removed_locks)))
+        try:
+            self.driver = await async_playwright().start()
+            if headless_override is not None:
+                effective_headless = headless_override
+            elif self.sticky_headful:
+                effective_headless = False
+            else:
+                effective_headless = self.should_run_headless()
+            self.is_currently_headless = effective_headless
+            self.context = await self.driver.chromium.launch_persistent_context(
+                str(self.profile),
+                headless=effective_headless,
+                channel=settings.douyin_browser_channel or settings.xhs_browser_channel,
+                viewport={"width": 1280, "height": 900},
+                accept_downloads=False,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                color_scheme="light",
+                args=[
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1280,900",
+                ],
+            )
+
+            # Use the installed browser's native UA, plugins and security isolation.
+
+
+            async def block_resources(route):
+                req = route.request
+                if self.should_block_resource(req.url, req.resource_type):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await self.context.route("**/*", block_resources)
+
+            # Sanitize profile cookies: purge dummy/corrupt values that break the
+            # session restore (same fix as the Xiaohongshu service).
+            try:
+                from backend.services.cookie_service import DUMMY_SUBSTRINGS
+
+                loaded_cookies = await self.context.cookies()
+                bad_cookies = [
+                    c for c in loaded_cookies
+                    if any(dummy in str(c.get("value", "")).lower() for dummy in DUMMY_SUBSTRINGS)
+                ]
+                if bad_cookies:
+                    logger.warning(
+                        "Purging %d dummy/corrupt cookies from Douyin browser profile...",
+                        len(bad_cookies),
+                    )
+                    clean_cookies = [
+                        c for c in loaded_cookies
+                        if not any(dummy in str(c.get("value", "")).lower() for dummy in DUMMY_SUBSTRINGS)
+                    ]
+                    await self.context.clear_cookies()
+                    if clean_cookies:
+                        await self.context.add_cookies(cast(Any, clean_cookies))
+            except Exception as e:
+                logger.debug("Profile cookie sanitization skipped: %s", e)
+
+            # Restore saved session cookies if present
+            auth_file = self.profile / "auth_state.json"
+            if auth_file.exists():
+                try:
+                    auth_data = json.loads(auth_file.read_text("utf-8"))
+                    cookies = auth_data.get("cookies", [])
+                    if cookies:
+                        await restore_missing_cookies(self.context, cookies)
+                except Exception:
+                    logger.debug("Could not restore cookies from auth_state.json")
+
+            # Inject custom cookie from settings if configured (skip dummy/test strings)
+            if settings.douyin_cookie:
+                try:
+                    from backend.services.cookie_service import (
+                        is_dummy_cookie,
+                        parse_cookie_str,
+                    )
+                    if not is_dummy_cookie(settings.douyin_cookie):
+                        tokens = parse_cookie_str(settings.douyin_cookie)
+                        if tokens:
+                            custom_cookies = [
+                                {"name": k, "value": v, "domain": ".douyin.com", "path": "/"}
+                                for k, v in tokens.items()
+                            ]
+                            await restore_missing_cookies(self.context, custom_cookies)
+                except Exception:
+                    pass
+
+            self.page = (
+                self.context.pages[0] if self.context.pages else await self.context.new_page()
+            )
+            self.page.set_default_timeout(10000)
+            nav_target = initial_url or self.base_url
+            try:
+                resp = await self.page.goto(nav_target, wait_until="domcontentloaded", timeout=30000)
+            except BrowserTimeout:
+                if not await has_usable_douyin_document(self.page):
+                    raise
+                logger.warning("Douyin DOM is usable after navigation timeout; inspecting the loaded page")
+                resp = None
+            if resp is not None:
+                self.last_http_status = resp.status
+            if not initial_url:
+                await self.page.wait_for_timeout(1500)
+            await self.inspect(self.page)
+            return self.page
+        except Exception as exc:
+            logger.error("Douyin ensure_open error: %s", exc)
+            # Any failure here (not only Playwright errors) must tear down the
+            # partial context, otherwise Chromium keeps the profile locked.
+            try:
+                await self._close()
+            except Exception:
+                pass
+            self.state = "network_error"
+            if isinstance(exc, BrowserTimeout):
+                raise ProviderUnavailableError(
+                    "Douyin chưa tải được trang trong 30 giây. Kiểm tra kết nối, mở cửa sổ Douyin để xác minh trạng thái rồi thử lại."
+                ) from None
+            raise ProviderUnavailableError(
+                f"Không mở được trình duyệt Douyin ({exc}). Kiểm tra Chromium đã cài và đóng phiên dùng cùng profile."
+            ) from None
+
+    async def _visible_captcha_evidence(self, page: Page) -> str | None:
+        return await visible_challenge_evidence(page)
+
+    async def probe_live(self) -> tuple[bool, str]:
+        if self.lock.locked():
+            return False, "browser_busy"
+        async with self.lock:
+            return await self._probe_live_unlocked()
+
+    async def _probe_live_unlocked(self) -> tuple[bool, str]:
+        """Probes live connectivity to Douyin using a dedicated page to avoid interrupting active searches."""
+        probe_page: Page | None = None
+        active_state: str | None = None
+        active_diagnostics: dict = {}
+        try:
+            await self._ensure_open_unlocked()
+            active_state = self.state
+            active_diagnostics = dict(self.diagnostics)
+            if not self.context:
+                return False, "Browser context unavailable"
+            probe_page = await self.context.new_page()
+            target_url = self.base_url or DOUYIN_HOME
+            resp = await probe_page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            http_status = resp.status if resp is not None else None
+            self.last_http_status = http_status
+            state = await self.inspect(probe_page)
+            if active_state in {"login_required", "verification_required", "restricted"}:
+                state = active_state
+
+            is_http_ok = http_status is not None and 200 <= http_status < 400
+            is_healthy = is_http_ok and state not in ("network_error", "closed", "restricted")
+            status_desc = f"HTTP {http_status}: {state}" if http_status else state
+            return is_healthy, status_desc
+        except Exception as exc:
+            logger.warning("Douyin live probe failed: %s", exc)
+            self.last_http_status = None
+            return False, f"error: {exc}"
+        finally:
+            if probe_page is not None:
+                try:
+                    if not probe_page.is_closed():
+                        await probe_page.close()
+                except Exception:
+                    pass
+            if active_state is not None:
+                self.state = active_state
+                self.diagnostics = active_diagnostics
+
+    async def inspect(self, page: Page) -> str:
+        if page.is_closed():
+            self.state = "closed"
+            self.diagnostics = {}
+            return self.state
+        try:
+            url = page.url
+            title = await page.title()
+            body = await page.locator("body").inner_text(timeout=5000)
+            page_state = classify_page(body, title, url)
+            self.state = page_state
+
+            parts = urlsplit(url)
+            query_param_names = list(parse_qs(parts.query).keys())
+
+            inputs = await page.locator("input:visible").all()
+            input_count = len(inputs)
+            search_input = page.locator("input[data-e2e='search-input'], input.search-input, input#search-input").first
+            search_val = ""
+            if await search_input.count() > 0:
+                try:
+                    search_val = (await search_input.input_value())[:100]
+                except Error:
+                    search_val = ""
+
+            # Check session cookies
+            has_session_cookie = False
+            c_names: set[str] = set()
+            if self.context:
+                try:
+                    c_list = await self.context.cookies()
+                    c_names = {
+                        name
+                        for c in c_list
+                        if (name := c.get("name")) is not None
+                    }
+                    has_session_cookie = bool(
+                        c_names & {"sessionid", "sessionid_ss", "sid_guard", "passport_csrf_token", "uid_tt", "uid_tt_ss"}
+                    )
+                except Exception:
+                    pass
+
+            # Check user login status
+            user_avatar = page.locator(
+                "[data-e2e='user-avatar']:visible, [data-e2e='header-avatar']:visible, .avatar-wrapper:visible, .user-avatar:visible, [data-e2e='user-info']:visible, img[src*='aweme-avatar']:visible"
+            )
+            has_user_element = (await user_avatar.count()) > 0
+            is_authenticated = bool(has_session_cookie and has_user_element)
+
+            # Check for explicit login buttons / links (presence means user is NOT logged in)
+            login_buttons = page.locator(
+                "[data-e2e='login-button']:visible, button:has-text('登录'):visible, a:has-text('登录'):visible, .header-login-btn:visible, :text('登录'):visible"
+            )
+            has_login_button = (await login_buttons.count()) > 0
+
+            captcha_evidence = await self._visible_captcha_evidence(page)
+            captcha_visible = bool(captcha_evidence) or page_state == "verification_required"
+
+            if page_state == "restricted":
+                self.state = "restricted"
+            elif captcha_visible:
+                self.state = "verification_required"
+            else:
+                self.state = page_state
+
+            # Check for dismissible login modal / mask
+            login_modal = page.locator(
+                "#login-panel:visible, .login-mask:visible, [class*='login-panel']:visible, [class*='login-modal']:visible, [class*='login-dialog']:visible"
+            )
+            login_modal_visible = (await login_modal.count()) > 0
+
+            # Automatically dismiss guest login popup if present, unless explicitly disabled (e.g. login flow)
+            if getattr(self, "dismiss_guest_modal", True) and login_modal_visible and not captcha_visible:
+                try:
+                    close_btn = page.locator(
+                        ".login-panel-close:visible, .dy-account-close:visible, [data-e2e='close-icon']:visible, #login-panel [class*='close']:visible, .login-mask [class*='close']:visible, [aria-label='关闭']:visible, [aria-label='Close']:visible, .semi-modal-close:visible, [data-e2e='modal-close-button']:visible"
+                    ).first
+                    if await close_btn.count() > 0:
+                        await close_btn.click(timeout=800)
+                        await page.wait_for_timeout(300)
+                    else:
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                    login_modal_visible = (await login_modal.count()) > 0
+                except Exception:
+                    pass
+
+            is_login_route = "/login" in parts.path
+
+            # Re-check login button visibility after modal close attempt
+            has_login_button = (await login_buttons.count()) > 0
+
+            # Re-evaluate is_authenticated after modal dismissal attempt
+            is_authenticated = bool(
+                has_session_cookie
+                and has_user_element
+                and not login_modal_visible
+                and not has_login_button
+                and not is_login_route
+                and "验证" not in title
+            )
+
+            if self.state in {"verification_required", "restricted"}:
+                pass
+            elif is_login_route:
+                self.state = "login_required"
+            elif login_modal_visible:
+                self.state = "login_required"
+            elif is_authenticated:
+                self.state = "authenticated"
+            else:
+                self.state = "page_available"
+
+            # Persist session state periodically: inspect() runs on every
+            # scroll iteration and a full storage_state+fsync each time stalls
+            # the search. _close() and explicit user actions still checkpoint
+            # immediately, so the session survives any shutdown.
+            if self.context:
+                try:
+                    now = time.monotonic()
+                    if now - self._last_checkpoint >= settings.session_checkpoint_min_interval:
+                        c_list = await self.context.cookies()
+                        if c_list:
+                            self._last_checkpoint = now
+                            await save_session_checkpoint(self.context, self.profile)
+                except Exception:
+                    pass
+
+            note_links = await page.locator('a[href*="/video/"]').count()
+            video_count = await page.locator("video").count()
+
+            self.diagnostics = {
+                "host": parts.netloc,
+                "path": parts.path,
+                "query_param_names": query_param_names,
+                "title": title[:200],
+                "input_count": input_count,
+                "search_input_value": search_val,
+                "login_modal_visible": login_modal_visible,
+                "captcha_visible": captcha_visible,
+                "captcha_detection_reason": captcha_evidence
+                or ("visible_challenge_text" if page_state == "verification_required" else None),
+                "has_session_cookie": has_session_cookie,
+                "has_user_element": has_user_element,
+                "has_login_button": has_login_button,
+                "is_authenticated": is_authenticated,
+                "result_links_count": note_links,
+                "video_elements_count": video_count,
+            }
+        except Exception as exc:
+            logger.debug("Exception in inspect: %s", exc, exc_info=True)
+            self.state = "network_error"
+        return self.state
+
+    async def open(self, headful: bool = True) -> dict:
+        if self.lock.locked():
+            return self.snapshot()
+        async with self.lock:
+            if headful:
+                page = await self.elevate_to_headful()
+                await page.bring_to_front()
+                await self.inspect(page)
+            else:
+                page = await self._ensure_open_unlocked()
+                page = self.get_active_page()
+                await page.bring_to_front()
+                await self.inspect(page)
+        return self.snapshot()
+
+    async def refresh_qr(self) -> dict:
+        if self.lock.locked():
+            return self.snapshot()
+        async with self.lock:
+            return await self._refresh_qr_unlocked()
+
+    async def _refresh_qr_unlocked(self) -> dict:
+        if not self.page or self.page.is_closed():
+            return self.snapshot()
+        try:
+            login_surface = self.page.locator(
+                "#login-panel:visible, .login-mask:visible, [class*='login-panel']:visible, "
+                "[class*='login-modal']:visible, [class*='login-dialog']:visible"
+            )
+            is_login_route = "/login" in urlsplit(self.page.url).path.lower()
+            if await login_surface.count() == 0 and not is_login_route:
+                await self.inspect(self.page)
+                self.diagnostics["qr_available"] = False
+                self.diagnostics["qr_message"] = "Douyin chưa hiển thị mã QR trên trang hiện tại."
+                return self.snapshot()
+
+            refresh_btn = self.page.locator(
+                "#login-panel .qrcode-mask:visible, #login-panel .refresh-btn:visible, "
+                "#login-panel :text('点击刷新'):visible, #login-panel :text('刷新'):visible, "
+                "[class*='login-panel'] [class*='refresh']:visible"
+            ).first
+            if await refresh_btn.count() > 0:
+                await refresh_btn.click(timeout=2000)
+            else:
+                await self.page.reload(wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(1)
+            await self.inspect(self.page)
+            self.diagnostics["qr_available"] = True
+        except Exception as exc:
+            # Surface the failure instead of silently returning a stale snapshot
+            # the user would stare at while the QR code has already expired.
+            logger.warning("Douyin QR refresh failed: %s", exc)
+        return self.snapshot()
+
+    async def refresh_status(self) -> dict:
+        if self.lock.locked():
+            return self.snapshot()
+        async with self.lock:
+            active = None
+            try:
+                active = self.get_active_page()
+            except Exception:
+                pass
+            if active:
+                try:
+                    if not active.is_closed():
+                        await self.inspect(active)
+                    else:
+                        await self._close()
+                except Exception:
+                    pass
+            elif self.page and self.page.is_closed():
+                await self._close()
+        return self.snapshot()
+
+    async def _close(self) -> None:
+        try:
+            if self.context:
+                try:
+                    await save_session_checkpoint(self.context, self.profile)
+                except Exception:
+                    pass
+                try:
+                    await self.context.close()
+                except Exception:
+                    pass
+        finally:
+            self.context = None
+            self.page = None
+            self.search_page = None
+            self.blocked_page = None
+            self.diagnostics = {}
+            if self.driver:
+                try:
+                    await self.driver.stop()
+                except Exception:
+                    pass
+                self.driver = None
+            self.state = "closed"
+            self.is_currently_headless = False
+            self._last_checkpoint = 0.0
+            if not getattr(self, "sticky_headful", False):
+                self.hybrid_headless = getattr(self, "default_hybrid_headless", True)
+                self.force_headful_session = False
+
+    async def close(self) -> None:
+        async with self.lock:
+            await self._close()
+
+    async def screenshot_note_images(
+        self,
+        note_url: str,
+        save_dir: Path,
+        page: Page | None = None,
+        max_slides: int | None = None,
+    ) -> list[Path]:
+        """Captures individual high-resolution screenshots for each slide of a Douyin image/note album."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        saved_paths: list[Path] = []
+        created_page = False
+        try:
+            if page is None:
+                if not self.context:
+                    await self.ensure_open()
+                if self.context:
+                    page = await self.context.new_page()
+                    created_page = True
+                else:
+                    page = self.page
+
+            if not page or page.is_closed():
+                return saved_paths
+
+            try:
+                await page.set_viewport_size({"width": 1280, "height": 900})
+            except Exception:
+                pass
+
+            if created_page:
+                await page.goto(note_url, wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(1.5)
+
+            # Detect indicator for total slides (e.g. "1/5", "2 / 6") if max_slides not specified
+            if max_slides is None:
+                max_slides = 20
+                try:
+                    indicator_text = await page.locator(
+                        "[class*='indicator'], [class*='slider-tag'], [class*='pagination'], [class*='count']"
+                    ).evaluate_all("els => els.map(e => e.innerText).join(' ')")
+                    
+                    m_ind = re.search(r"\d+\s*/\s*(\d+)", str(indicator_text))
+                    if m_ind:
+                        total_from_ind = int(m_ind.group(1))
+                        if 1 <= total_from_ind <= 50:
+                            max_slides = total_from_ind
+                except Exception:
+                    pass
+
+            seen_sources: set[str] = set()
+            consecutive_duplicate_steps = 0
+            start_loop_time = asyncio.get_running_loop().time()
+            max_duration_seconds = 30.0
+
+            first_slide_src: str | None = None
+            for _ in range(max_slides):
+                if asyncio.get_running_loop().time() - start_loop_time > max_duration_seconds:
+                    logger.debug("Reached timeout while capturing note slides from %s", note_url)
+                    break
+
+                # Query current active slide image and mark it in DOM
+                slide_img = await page.evaluate(
+                    """() => {
+                        const container = document.querySelector('[data-e2e="note-detail"], .slider-video, [class*="slider"], [class*="carousel"]') || document.body;
+                        container.querySelectorAll('img[data-current-active-slide="true"]').forEach(el => el.removeAttribute('data-current-active-slide'));
+                        const imgs = Array.from(container.querySelectorAll('img')).filter(img => {
+                            const r = img.getBoundingClientRect();
+                            return r.width >= 150 && r.height >= 150 && r.bottom > 0 && r.top < window.innerHeight;
+                        });
+                        if (!imgs.length) return null;
+                        imgs.sort((a, b) => {
+                            const ra = a.getBoundingClientRect();
+                            const rb = b.getBoundingClientRect();
+                            return (rb.width * rb.height) - (ra.width * ra.height);
+                        });
+                        const best = imgs[0];
+                        best.setAttribute('data-current-active-slide', 'true');
+                        return best.currentSrc || best.src || best.getAttribute('data-src') || best.getAttribute('data-origin') || null;
+                    }"""
+                )
+
+                if slide_img:
+                    src_str = str(slide_img)
+                    if first_slide_src is None:
+                        first_slide_src = src_str
+                    elif src_str == first_slide_src and len(saved_paths) >= 1:
+                        logger.debug("Cycled back to initial slide (%s), stopping capture.", src_str)
+                        break
+
+                found_new = False
+                if slide_img and str(slide_img) not in seen_sources:
+                    seen_sources.add(str(slide_img))
+                    out_file = save_dir / f"{len(saved_paths) + 1:03d}.png"
+                    card = page.locator("img[data-current-active-slide='true']").first
+                    try:
+                        if await card.count() > 0:
+                            await card.screenshot(path=str(out_file))
+                        else:
+                            fallback_card = page.locator(
+                                "[data-e2e='note-detail'] img, .slider-video img, [class*='slider'] img"
+                            ).first
+                            if await fallback_card.count() > 0:
+                                await fallback_card.screenshot(path=str(out_file))
+                            else:
+                                await page.screenshot(path=str(out_file))
+                        if out_file.exists() and out_file.stat().st_size > 0:
+                            saved_paths.append(out_file)
+                            found_new = True
+                    except Exception:
+                        pass
+
+                if found_new:
+                    consecutive_duplicate_steps = 0
+                else:
+                    consecutive_duplicate_steps += 1
+                    if consecutive_duplicate_steps >= 2 and len(saved_paths) >= 1:
+                        break
+
+                # Advance to next slide via button or keyboard
+                next_btn = page.locator(
+                    "[class*='arrow-right'], [class*='slider-arrow-right'], [class*='switch-right'], [class*='btn-next'], [data-e2e*='next'], button[aria-label*='下一']"
+                ).first
+                clicked = False
+                try:
+                    if await next_btn.count() > 0 and await next_btn.is_visible():
+                        await next_btn.click(timeout=800)
+                        clicked = True
+                except Exception:
+                    pass
+
+                if not clicked:
+                    try:
+                        await page.keyboard.press("ArrowRight")
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(0.4)
+
+            # Fallback if no large images were screenshot
+            if not saved_paths:
+                fallback_file = save_dir / "001.png"
+                card = page.locator("[data-e2e='note-detail'], .note-detail, .slider-video, [class*='slider']").first
+                if await card.count() > 0:
+                    await card.screenshot(path=str(fallback_file))
+                else:
+                    await page.screenshot(path=str(fallback_file))
+                saved_paths.append(fallback_file)
+
+        except Exception as err:
+            logger.warning("Failed screenshotting note images from %s: %s", note_url, err)
+        finally:
+            if created_page and page and not page.is_closed():
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        return saved_paths

@@ -1,0 +1,147 @@
+import asyncio
+
+from backend.app.main import app
+
+
+def test_health_validation_and_origin(client):
+    assert client.get("/api/health").json()["status"] == "online"
+    assert client.post("/api/search", json={"query": " "}).status_code == 422
+    assert client.get("/api/videos?sort=bad").status_code == 422
+    assert (
+        client.post(
+            "/api/search", json={"query": "hi"}, headers={"origin": "https://evil.invalid"}
+        ).status_code
+        == 403
+    )
+    assert client.get("/api/videos/no-such-id").status_code == 404
+
+
+def test_real_search_accepts_both_platforms_and_rejects_mismatched_modes(client, monkeypatch):
+    # Validate the public API without launching a browser or writing a live manifest.
+    submitted = []
+    monkeypatch.setattr(app.state.search, "submit", submitted.append)
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "dụng cụ bóc sticker",
+            "mode": "both",
+            "platforms": ["douyin", "xiaohongshu"],
+            "limit": 5,
+        },
+    )
+    assert response.status_code == 202
+    assert response.json()["platforms"] == ["douyin", "xiaohongshu"]
+    assert response.json()["is_mock"] is False
+    assert submitted == [response.json()["id"]]
+
+    invalid = [
+        {"mode": "both", "platforms": ["douyin"]},
+        {"mode": "douyin", "platforms": ["douyin", "xiaohongshu"]},
+        {"mode": "both", "platforms": ["douyin", "douyin"]},
+        {"mode": "both", "platforms": ["douyin", "tiktok"]},
+        {"mode": "tiktok", "platforms": ["tiktok"]},
+        {"mode": "youtube_shorts", "platforms": ["youtube_shorts"]},
+    ]
+    for values in invalid:
+        assert client.post("/api/search", json={"query": "sticker", "limit": 5, **values}).status_code == 422
+
+
+def test_resume_interrupted_resubmits_and_rejects_terminal(client, sessions, monkeypatch):
+    from backend.models import SearchJob
+
+    submitted = []
+    monkeypatch.setattr(app.state.search, "submit", submitted.append)
+    with sessions() as db:
+        job = SearchJob(
+            original_query="sticker",
+            platforms=["douyin"],
+            requested_limit=5,
+            status="interrupted",
+            is_mock=True,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+    response = client.post(f"/api/search/jobs/{job_id}/resume")
+    assert response.status_code == 200
+    assert submitted == [job_id]
+
+    with sessions() as db:
+        done = SearchJob(
+            original_query="done",
+            platforms=["douyin"],
+            requested_limit=5,
+            status="completed",
+            is_mock=True,
+        )
+        db.add(done)
+        db.commit()
+        done_id = done.id
+    assert client.post(f"/api/search/jobs/{done_id}/resume").status_code == 409
+
+
+def test_filters_pagination_and_save(client, sessions):
+    from tests.test_pipeline import make_job
+
+    job_id = make_job(sessions, 50)
+    asyncio.run(app.state.search.run(job_id))
+    result = client.get(f"/api/videos?job_id={job_id}&page_size=10&sort=likes").json()
+    assert result["total"] == 50 and len(result["items"]) == 10
+    likes = [v["like_count"] for v in result["items"]]
+    assert likes == sorted(likes, reverse=True)
+    video_id = result["items"][0]["id"]
+    assert client.post(f"/api/videos/{video_id}/save").json()["status"] == "saved"
+    saved = client.get("/api/videos?status=saved").json()
+    assert saved["total"] == 1 and saved["items"][0]["id"] == video_id
+    assert client.post(f"/api/videos/{video_id}/skip").json()["status"] == "skipped"
+    assert client.get("/api/videos?status=saved").json()["total"] == 0
+    assert client.get("/api/videos?platform=douyin").json()["total"] == 25
+    assert client.get("/api/videos?q=%25").json()["total"] == 0
+    assert client.get("/api/videos?min_relevance=80").json()["total"] > 0
+    assert client.get("/api/videos?since=2099-01-01T00:00:00").json()["total"] == 0
+
+
+def test_settings_write_only_secret_and_preserve_key(client, tmp_path, monkeypatch):
+    from backend.api import settings as settings_api
+    from backend.services.ai_service import AIService
+    from tests.test_ai import config
+
+    cfg = config()
+    monkeypatch.setattr(settings_api, "ROOT", tmp_path)
+    monkeypatch.setattr(settings_api, "settings", cfg)
+    app.state.ai = AIService(cfg)
+    (tmp_path / ".env").write_text("UNCHANGED=yes\nAI_API_KEY='test-secret'\n", encoding="utf-8")
+    body = {
+        "ai_provider": "gemini",
+        "ai_model": "gemini-3.1-flash-lite",
+        "ai_free_tier_confirmed": True,
+    }
+    response = client.patch("/api/settings", json=body)
+    assert response.status_code == 200 and response.json()["ai_key_configured"]
+    assert "test-secret" not in response.text
+    assert "test-secret" in (tmp_path / ".env").read_text(encoding="utf-8")
+    body["ai_api_key"] = "replacement-secret"
+    assert client.patch("/api/settings", json=body).status_code == 200
+    assert cfg.ai_api_key.get_secret_value() == "replacement-secret"
+    assert "replacement-secret" not in client.get("/api/settings").text
+    assert "UNCHANGED=yes" in (tmp_path / ".env").read_text(encoding="utf-8")
+    assert not list(tmp_path.glob(".env.*"))
+    body["ai_model"] = "paid-model"
+    rejected = client.patch("/api/settings", json=body)
+    assert rejected.status_code == 422 and "replacement-secret" not in rejected.text
+
+
+def test_expansion_endpoint_and_old_job_compatibility(client, sessions):
+    import json
+
+    from backend.services.ai_service import AIService
+    from tests.test_ai import FakeAI, config, payload
+    from tests.test_pipeline import make_job
+
+    fake = FakeAI([json.dumps(payload())])
+    app.state.ai = AIService(config(), lambda _: fake)
+    response = client.post("/api/search/expand", json={"query": "unbox đồ cute"})
+    assert response.status_code == 200 and response.json()["source"] == "gemini"
+    job_id = make_job(sessions)
+    job = client.get(f"/api/search/jobs/{job_id}").json()
+    assert job["queries"] == ["unbox đồ cute"] and job["ai_source"] == "original"

@@ -1,0 +1,1018 @@
+"use client";
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  ArrowUpRight,
+  Search,
+  FlaskConical,
+  X,
+  Check,
+  Clock3,
+  ArrowRight,
+  Zap,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { ErrorBanner } from "@/components/error-banner";
+import { api, platformName, statusName } from "@/lib/api";
+import { useResource } from "@/lib/use-resource";
+import { useSSEListener } from "@/lib/use-event-source";
+import type { Job, Page, Platform, Settings } from "@/types";
+import { VideoGrid } from "@/features/video/video-grid";
+
+import {
+  QueryExpansionPanel,
+  selectedTerms,
+  type QueryChoice,
+} from "./query-expansion";
+
+import { BrowserControls } from "./browser-controls";
+
+const terminal = ["completed", "failed", "cancelled", "interrupted"];
+
+/** Preset-or-custom quality threshold: a select of common cutoffs whose last
+ * option ("Số khác…") swaps in a free number input, so users can type any
+ * value (e.g. 3700 likes) instead of picking from the list. */
+function ThresholdPicker({
+  label,
+  tooltip,
+  ariaLabel,
+  value,
+  onChange,
+  presets,
+  customStart,
+  format,
+  disabled,
+}: {
+  label: string;
+  tooltip: string;
+  ariaLabel: string;
+  value: number;
+  onChange: (value: number) => void;
+  presets: number[];
+  customStart: number;
+  format: (n: number) => string;
+  disabled?: boolean;
+}) {
+  const isPreset = value === 0 || presets.includes(value);
+  if (isPreset) {
+    return (
+      <label className="row muted" title={tooltip}>
+        {label}
+        <select
+          aria-label={ariaLabel}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => {
+            if (e.target.value === "custom") {
+              onChange(customStart);
+            } else {
+              onChange(Number(e.target.value));
+            }
+          }}
+        >
+          {presets.map((n) => (
+            <option key={n} value={n}>
+              {n === 0 ? "Mọi mức" : format(n)}
+            </option>
+          ))}
+          <option value="custom">Số khác…</option>
+        </select>
+      </label>
+    );
+  }
+  return (
+    <label className="row muted" title={tooltip}>
+      {label}
+      <input
+        type="number"
+        min={0}
+        step={100}
+        aria-label={`${ariaLabel} (số tùy chọn)`}
+        value={value === 0 ? "" : value}
+        disabled={disabled}
+        style={{ width: "92px" }}
+        onChange={(e) => {
+          const parsed = Number(e.target.value);
+          onChange(
+            Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0,
+          );
+        }}
+      />
+      <button
+        type="button"
+        className="muted"
+        title="Xóa ngưỡng tùy chọn, quay lại danh mục"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          padding: "0 2px",
+          font: "inherit",
+        }}
+        onClick={() => onChange(0)}
+      >
+        ✕
+      </button>
+    </label>
+  );
+}
+
+export type SearchMode = "mock" | "xiaohongshu" | "douyin" | "both" | "tiktok" | "youtube_shorts";
+
+export function parseSearchMode(raw: string | null | undefined): SearchMode {
+  if (!raw) return "xiaohongshu";
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "xiaohongshu") return "xiaohongshu";
+  if (normalized === "douyin") return "douyin";
+  if (normalized === "both") return "both";
+  if (normalized === "tiktok") return "tiktok";
+  if (normalized === "youtube_shorts" || normalized === "youtube") return "youtube_shorts";
+  return "mock";
+}
+
+export function SearchWorkspace() {
+  const params = useSearchParams();
+  const initialMode = parseSearchMode(params.get("mode"));
+  return (
+    <SearchSession
+      key={params.toString()}
+      initialQuery={params.get("q") ?? ""}
+      initialJob={params.get("job")}
+      initialMode={initialMode}
+    />
+  );
+}
+export function normalizeLimitForMode(currentLimit: number, targetMode: string): number {
+  const allowed =
+    targetMode === "mock"
+      ? [20, 50, 100, 200]
+      : [5, 10, 20, 50, 100];
+  if (allowed.includes(currentLimit)) {
+    return currentLimit;
+  }
+  return 20;
+}
+
+export function mapSortByToGridSort(sortBy: string): string {
+  if (sortBy === "most_liked") return "likes";
+  if (sortBy === "newest") return "newest";
+  return "best";
+}
+
+function SearchSession({
+  initialQuery,
+  initialJob,
+  initialMode,
+}: {
+  initialQuery: string;
+  initialJob: string | null;
+  initialMode: SearchMode;
+}) {
+  const router = useRouter();
+  const [mode, setMode] = useState<SearchMode>(initialMode);
+  const [useAI, setUseAI] = useState(false);
+  const [choice, setChoice] = useState<QueryChoice | null>(null);
+  const settings = useResource<Settings>("/settings");
+  const [query, setQuery] = useState(initialQuery);
+  const [platforms, setPlatforms] = useState<Platform[]>(
+    initialMode === "mock" || initialMode === "both"
+      ? ["douyin", "xiaohongshu"]
+      : [initialMode as Platform],
+  );
+  const [limit, setLimit] = useState(() => normalizeLimitForMode(20, initialMode));
+  const [sortBy, setSortBy] = useState<"relevance" | "most_liked" | "newest">("relevance");
+  const [publishTime, setPublishTime] = useState<"all" | "day" | "week" | "six_months">("all");
+  const [contentType, setContentType] = useState<"all" | "video" | "image_text">("all");
+  const [minLikes, setMinLikes] = useState(0);
+  const [minViews, setMinViews] = useState(0);
+  // "Chỉ video viral" shortcut: applies tim ≥ 10K + view ≥ 100K + 1 tuần qua,
+  // and restores the user's previous thresholds when toggled off.
+  const VIRAL_PRESET = { likes: 10000, views: 100000, time: "week" as const };
+  const prevBeforeViral = useRef<{
+    likes: number;
+    views: number;
+    time: "all" | "day" | "week" | "six_months";
+  } | null>(null);
+  const viralActive =
+    minLikes >= VIRAL_PRESET.likes &&
+    minViews >= VIRAL_PRESET.views &&
+    publishTime === VIRAL_PRESET.time;
+  function toggleViralPreset() {
+    if (viralActive) {
+      const prev = prevBeforeViral.current ?? { likes: 0, views: 0, time: "all" as const };
+      setMinLikes(prev.likes);
+      setMinViews(prev.views);
+      setPublishTime(prev.time);
+    } else {
+      prevBeforeViral.current = { likes: minLikes, views: minViews, time: publishTime };
+      setMinLikes(VIRAL_PRESET.likes);
+      setMinViews(VIRAL_PRESET.views);
+      setPublishTime(VIRAL_PRESET.time);
+    }
+  }
+  const [exactHashtag, setExactHashtag] = useState(false);
+  const [jobId, setJobId] = useState<string | null>(initialJob);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  // Poll the job every second while it runs; once it reaches a terminal state
+  // stop the timer entirely (interval 0) instead of hammering a finished job.
+  const [jobPollMs, setJobPollMs] = useState(1000);
+  const job = useResource<Job>(jobId ? `/search/jobs/${jobId}` : null, jobPollMs);
+  const stats = useResource<{
+    total: number;
+    saved: number;
+    used: number;
+    jobs: number;
+  }>("/stats", 5000);
+  const recent = useResource<Page<Job>>("/search/jobs", 5000);
+
+  useEffect(() => {
+    setJobPollMs(1000);
+  }, [jobId]);
+
+  useEffect(() => {
+    if (job.data && terminal.includes(job.data.status)) {
+      setJobPollMs(0);
+    }
+  }, [job.data?.status]);
+
+  useSSEListener("search:update", (data: { job_id?: string; status?: string }) => {
+    if (jobId && data?.job_id === jobId) {
+      job.refresh();
+      if (data.status && terminal.includes(data.status)) {
+        stats.refresh();
+        recent.refresh();
+      }
+    }
+  });
+
+  const isRunning = Boolean(
+    jobId && job.data && ["searching", "ranking", "expanding_query", "resuming"].includes(job.data.status),
+  );
+  const active = Boolean(
+    jobId && (!job.data || !terminal.includes(job.data.status)),
+  );
+  async function start(event?: React.FormEvent) {
+    event?.preventDefault();
+    if (!query.trim() || !platforms.length) return;
+    const terms =
+      choice?.topic === query.trim().replace(/\s+/g, " ")
+        ? selectedTerms(choice.text)
+        : [];
+    const isReal = mode !== "mock";
+    if (
+      terms.length > (isReal ? 3 : 10) ||
+      terms.some((v) => v.length > 300)
+    ) {
+      setError(
+        isReal
+          ? "Tìm thật dùng tối đa 3 truy vấn, mỗi truy vấn không quá 300 ký tự."
+          : "Tối đa 10 truy vấn, mỗi truy vấn không quá 300 ký tự.",
+      );
+      return;
+    }
+    setBusy(true);
+    setError("");
+
+    // Automatically cancel any active or waiting job before launching the new search
+    if (jobId && job.data && !terminal.includes(job.data.status)) {
+      const confirmed = window.confirm(
+        "Đang có lượt tìm chưa hoàn tất. Bắt đầu lượt tìm mới sẽ hủy lượt cũ. Tiếp tục?",
+      );
+      if (!confirmed) {
+        setBusy(false);
+        return;
+      }
+      try {
+        await api(`/search/jobs/${jobId}/cancel`, { method: "POST" });
+      } catch (e) {
+        setError(`Không hủy được lượt tìm cũ: ${(e as Error).message}`);
+        setBusy(false);
+        return;
+      }
+    }
+
+    const hasHashtag = /#([^\s#]+)/.test(query) || query.trim().startsWith("#");
+    if (exactHashtag && !hasHashtag) {
+      setError("Vui lòng nhập thẻ hashtag với ký tự # (ví dụ: #decorbanhoc) khi bật chế độ Khớp chính xác Hashtag.");
+      setBusy(false);
+      return;
+    }
+
+    try {
+      const extractedTag = hasHashtag
+        ? (query.match(/#([^\s#]+)/)?.[1] || query.trim().replace(/^#+/, "").split(/\s+/)[0])
+        : undefined;
+      const result = await api<Job>("/search", {
+        method: "POST",
+        body: JSON.stringify({
+          query,
+          mode,
+          platforms:
+            mode === "mock"
+              ? platforms
+              : mode === "both"
+                ? ["douyin", "xiaohongshu"]
+                : [mode as Platform],
+          limit: normalizeLimitForMode(limit, mode),
+          use_ai: useAI,
+          selected_queries: terms.length ? terms : undefined,
+          sort_by: sortBy,
+          publish_time: publishTime,
+          content_type: contentType,
+          min_likes: minLikes,
+          min_views: minViews,
+          exact_hashtag: exactHashtag || hasHashtag,
+          target_hashtag: extractedTag,
+        }),
+      });
+      setJobId(result.id);
+      window.history.replaceState(
+        null,
+        "",
+        `/?job=${result.id}&q=${encodeURIComponent(query)}&mode=${mode}`,
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function cancel() {
+    try {
+      await api(`/search/jobs/${jobId}/cancel`, { method: "POST" });
+      job.refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  function selectPlatform(p: Platform) {
+    if (mode === "mock") {
+      setPlatforms((current) =>
+        current.includes(p)
+          ? current.length > 1
+            ? current.filter((item) => item !== p)
+            : current
+          : [...current, p],
+      );
+    } else {
+      setMode(p);
+      setPlatforms([p]);
+      setLimit((prev) => normalizeLimitForMode(prev, p));
+    }
+  }
+  return (
+    <>
+      <div className="page-heading">
+        <div>
+          <h1>Khám phá nội dung video</h1>
+          <p>Tìm kiếm, chọn lọc và phân tích video thịnh hành từ Douyin & Xiaohongshu.</p>
+        </div>
+        <span className="mode-pill">
+          <FlaskConical size={14} />
+          {mode === "mock"
+            ? "Dữ liệu mẫu"
+            : mode === "both"
+              ? "Douyin + Xiaohongshu"
+              : mode === "douyin"
+                ? "Douyin"
+                : mode === "xiaohongshu"
+                  ? "Xiaohongshu"
+                  : mode === "tiktok"
+                    ? "TikTok Global"
+                    : "YouTube Shorts"}
+        </span>
+      </div>
+      <div className="stats-strip">
+        {[
+          ["Video trong workspace", stats.data?.total],
+          ["Video đã lưu", stats.data?.saved],
+          ["Video đã dùng", stats.data?.used],
+          ["Lượt tìm kiếm", stats.data?.jobs],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>
+              {value ?? "—"}
+              <ArrowUpRight size={17} />
+            </strong>
+          </div>
+        ))}
+      </div>
+      <section className="search-panel">
+        <div className="search-panel-title">
+          <div>
+            <h2>Tìm kiếm chủ đề video</h2>
+            <p>Nhập từ khóa tiếng Việt hoặc thẻ #hashtag để khám phá nội dung.</p>
+          </div>
+        </div>
+        <form onSubmit={start}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.85rem", flexWrap: "wrap", gap: "0.5rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+              <span className="muted" style={{ fontSize: "12px", fontWeight: 500 }}>Nguồn dữ liệu:</span>
+              <select
+                aria-label="Nguồn tìm kiếm"
+                data-testid="mode-select"
+                value={mode}
+                onChange={(e) => {
+                  const newMode = e.target.value as "mock" | "douyin" | "xiaohongshu" | "both";
+                  setMode(newMode);
+                  if (newMode === "mock" || newMode === "both") {
+                    setPlatforms(["douyin", "xiaohongshu"]);
+                  } else {
+                    setPlatforms([newMode as Platform]);
+                  }
+                  setLimit((prev) => normalizeLimitForMode(prev, newMode));
+                }}
+                className="sr-only"
+              >
+                <option value="xiaohongshu">xiaohongshu</option>
+                <option value="douyin">douyin</option>
+                <option value="both">both</option>
+                <option value="mock">mock</option>
+              </select>
+              <div className="segmented-control" role="group" aria-label="Nền tảng tìm kiếm">
+                <button
+                  type="button"
+                  data-testid="platform-select-xhs"
+                  className={`segmented-button ${mode === "xiaohongshu" ? "active" : ""}`}
+                  onClick={() => {
+                    setMode("xiaohongshu");
+                    setPlatforms(["xiaohongshu"]);
+                    setLimit((prev) => normalizeLimitForMode(prev, "xiaohongshu"));
+                  }}
+                >
+                  <span className="red-mark">小红书</span>
+                  Xiaohongshu
+                </button>
+                <button
+                  type="button"
+                  data-testid="platform-select-douyin"
+                  className={`segmented-button ${mode === "douyin" ? "active" : ""}`}
+                  onClick={() => {
+                    setMode("douyin");
+                    setPlatforms(["douyin"]);
+                    setLimit((prev) => normalizeLimitForMode(prev, "douyin"));
+                  }}
+                >
+                  <span className="dy-mark">♪</span>
+                  Douyin
+                </button>
+                <button
+                  type="button"
+                  data-testid="platform-select-both"
+                  className={`segmented-button ${mode === "both" ? "active" : ""}`}
+                  onClick={() => {
+                    setMode("both");
+                    setPlatforms(["douyin", "xiaohongshu"]);
+                    setLimit((prev) => normalizeLimitForMode(prev, "both"));
+                  }}
+                >
+                  Cả hai nền tảng
+                </button>
+                <button
+                  type="button"
+                  data-testid="platform-select-mock"
+                  className={`segmented-button ${mode === "mock" ? "active" : ""}`}
+                  onClick={() => {
+                    setMode("mock");
+                    setPlatforms(["douyin", "xiaohongshu"]);
+                    setLimit((prev) => normalizeLimitForMode(prev, "mock"));
+                  }}
+                >
+                  Dữ liệu mẫu
+                </button>
+              </div>
+            </div>
+            {mode !== "mock" && (
+              <span className="metric-pill">
+                Tự động dịch sang tiếng Trung
+              </span>
+            )}
+          </div>
+          {mode === "both" && (
+            <p className="muted" style={{ fontSize: "0.82rem", margin: "0.25rem 0 0.75rem" }}>
+              Hạn mức tổng được chia gần đều cho Douyin và Xiaohongshu. Nếu một nền tảng yêu cầu đăng nhập hoặc xác minh, lượt tìm sẽ chờ bạn hoàn tất trước khi tiếp tục.
+            </p>
+          )}
+          <div className="search-input-row">
+            <Search size={20} />
+            <input
+              aria-label="Chủ đề tìm kiếm"
+              data-testid="search-input"
+              placeholder="Ví dụ: unbox đồ cute, #decorbanhoc, #ootd, dụng cụ bóc sticker…"
+              value={query}
+              maxLength={300}
+              onChange={(e) => setQuery(e.target.value)}
+              required
+            />
+            <Button
+              disabled={busy || !query.trim() || !platforms.length}
+              type="submit"
+            >
+              <Search size={16} />
+              {busy
+                ? "Đang gửi…"
+                : isRunning
+                  ? "Đang tìm…"
+                  : mode === "mock"
+                    ? "Tìm video mẫu"
+                    : mode === "both"
+                      ? "Tìm trên cả hai"
+                    : `Tìm trên ${platformName(mode)}`}
+              <ArrowRight size={16} />
+            </Button>
+          </div>
+          {query.trim().startsWith("#") && (
+            <div style={{ margin: "0.4rem 0 0.5rem 0.25rem", fontSize: "0.82rem", color: "var(--accent)", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+              <span>Đang lọc theo Hashtag chính xác:</span>
+              <strong style={{ background: "var(--accent-light)", padding: "0.1rem 0.4rem", borderRadius: "4px" }}>
+                {query.trim()}
+              </strong>
+            </div>
+          )}
+          {exactHashtag && !query.includes("#") && (
+            <div style={{ margin: "0.4rem 0 0.5rem 0.25rem", fontSize: "0.82rem", color: "var(--warning)", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+              <span>⚠️ Nhập thêm thẻ #hashtag (ví dụ: #decorbanhoc) vào ô tìm kiếm để lọc chính xác thẻ.</span>
+            </div>
+          )}
+          <div className="search-options" style={{ marginTop: "1rem" }}>
+            {mode === "mock" ? (
+              <div className="row wrap">
+                <span className="muted" style={{ fontWeight: 500 }}>Nền tảng mẫu:</span>
+                {(["xiaohongshu", "douyin", "tiktok", "youtube_shorts"] as Platform[]).map((p) => {
+                  const isSelected = platforms.includes(p);
+                  return (
+                    <button
+                      key={p}
+                      type="button"
+                      className={`filter-chip ${isSelected ? "active" : ""}`}
+                      onClick={() => selectPlatform(p)}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        readOnly
+                      />
+                      <span>{platformName(p)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : <div />}
+            <div className="row wrap" style={{ gap: "8px", alignItems: "center" }}>
+              <label className="row muted">
+                Số lượng
+                <select
+                  aria-label="Số kết quả"
+                  value={limit}
+                  onChange={(e) => setLimit(Number(e.target.value))}
+                >
+                  {(mode !== "mock"
+                    ? [5, 10, 20, 50, 100]
+                    : [20, 50, 100, 200]
+                  ).map((n) => (
+                    <option key={n} value={n}>
+                      {n} video
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {mode !== "mock" && (
+                <>
+                  <ThresholdPicker
+                    label="Tim tối thiểu"
+                    tooltip="Bỏ qua ứng viên có lượt tim thấp hơn ngưỡng ngay khi quét — tìm nhanh và chất lượng hơn"
+                    ariaLabel="Lượt tim tối thiểu"
+                    value={minLikes}
+                    onChange={setMinLikes}
+                    presets={[0, 100, 500, 1000, 5000, 10000, 50000, 100000]}
+                    customStart={100}
+                    format={(n) => (n >= 1000 ? `≥ ${n / 1000}K` : `≥ ${n}`)}
+                    disabled={busy}
+                  />
+                  <ThresholdPicker
+                    label="View tối thiểu"
+                    tooltip="Áp dụng cho nền tảng có công khai lượt xem (Douyin); ứng viên không rõ lượt xem vẫn được giữ"
+                    ariaLabel="Lượt xem tối thiểu"
+                    value={minViews}
+                    onChange={setMinViews}
+                    presets={[0, 1000, 5000, 10000, 50000, 100000, 500000, 1000000]}
+                    customStart={1000}
+                    format={(n) => (n >= 1000000 ? `≥ ${n / 1000000}M` : `≥ ${n / 1000}K`)}
+                    disabled={busy}
+                  />
+                </>
+              )}
+              {mode === "douyin" && (
+                <>
+                  <label className="row muted">
+                    Sắp xếp
+                    <select
+                      aria-label="Thứ tự sắp xếp"
+                      value={sortBy}
+                      disabled={busy}
+                      onChange={(e) => setSortBy(e.target.value as "relevance" | "most_liked" | "newest")}
+                    >
+                      <option value="relevance">Tổng hợp</option>
+                      <option value="most_liked">Nhiều like</option>
+                      <option value="newest">Mới nhất</option>
+                    </select>
+                  </label>
+                  <label className="row muted">
+                    Thời gian
+                    <select
+                      aria-label="Thời gian đăng"
+                      value={publishTime}
+                      disabled={busy}
+                      onChange={(e) => setPublishTime(e.target.value as "all" | "day" | "week" | "six_months")}
+                    >
+                      <option value="all">Mọi lúc</option>
+                      <option value="day">24h qua</option>
+                      <option value="week">1 tuần qua</option>
+                      <option value="six_months">6 tháng qua</option>
+                    </select>
+                  </label>
+                  <label className="row muted">
+                    Định dạng
+                    <select
+                      aria-label="Loại nội dung"
+                      value={contentType}
+                      disabled={busy}
+                      onChange={(e) => setContentType(e.target.value as "all" | "video" | "image_text")}
+                    >
+                      <option value="all">Tất cả</option>
+                      <option value="video">Chỉ Video</option>
+                      <option value="image_text">Chỉ 图文 (Ảnh)</option>
+                    </select>
+                  </label>
+                </>
+              )}
+            </div>
+          </div>
+          <div className="row wrap" style={{ alignItems: "center", gap: "0.6rem", marginTop: "0.5rem" }}>
+            {mode !== "mock" && (
+              <button
+                type="button"
+                className={`filter-chip ${viralActive ? "active" : ""}`}
+                onClick={toggleViralPreset}
+                disabled={busy}
+                aria-pressed={viralActive}
+                data-testid="viral-preset-toggle"
+                title="Áp nhanh bộ lọc: tim ≥ 10K, view ≥ 100K, đăng trong 1 tuần qua. Bấm lần nữa để trả về ngưỡng cũ."
+              >
+                <Zap size={13} style={{ marginRight: "0.3rem" }} />
+                <span>Chỉ video viral</span>
+              </button>
+            )}
+            <label className={`filter-chip ${useAI ? "active" : ""}`}>
+              <input
+                type="checkbox"
+                aria-label="Tự tạo từ khóa AI khi tìm"
+                data-testid="ai-expand-toggle"
+                checked={useAI}
+                onChange={(e) => setUseAI(e.target.checked)}
+                disabled={busy}
+              />
+              <span>Mở rộng từ khóa tự động</span>
+            </label>
+            <label className={`filter-chip ${exactHashtag || query.trim().startsWith("#") ? "active" : ""}`} title="Chỉ giữ lại video có gắn đúng thẻ hashtag được yêu cầu">
+              <input
+                type="checkbox"
+                aria-label="Khớp chính xác #Hashtag"
+                data-testid="exact-hashtag-toggle"
+                checked={exactHashtag || query.trim().startsWith("#")}
+                onChange={(e) => setExactHashtag(e.target.checked)}
+                disabled={busy || query.trim().startsWith("#")}
+              />
+              <span>Khớp chính xác #Hashtag</span>
+            </label>
+          </div>
+          <QueryExpansionPanel
+            query={query}
+            enabled={Boolean(settings.data?.ai_available)}
+            disabled={busy}
+            choice={choice}
+            onChange={setChoice}
+          />
+        </form>
+        <div className="suggestions">
+          <span>Thử một chủ đề</span>
+          {[
+            "unbox đồ cute",
+            "dụng cụ bóc sticker",
+            "decor bàn học",
+            "BJD makeup",
+          ].map((q) => (
+            <button key={q} type="button" onClick={() => setQuery(q)}>
+              {q}
+              <ArrowUpRight size={12} />
+            </button>
+          ))}
+        </div>
+      </section>
+      {(mode === "xiaohongshu" || mode === "both") && !active && (!job.data || terminal.includes(job.data.status)) && (
+        <section className="job-progress">
+          <p>
+            Tìm thật trên Xiaohongshu: tối đa 3 truy vấn và 100 video. Các số
+            liệu chưa đọc được sẽ để trống.
+          </p>
+          <BrowserControls platform="xiaohongshu" />
+        </section>
+      )}
+      {(mode === "douyin" || mode === "both") && !active && (!job.data || terminal.includes(job.data.status)) && (
+        <section className="job-progress">
+          <p>
+            Tìm thật trên Douyin: tối đa 3 truy vấn và 100 video. Các số liệu
+            chưa đọc được sẽ để trống.
+          </p>
+          <BrowserControls platform="douyin" />
+        </section>
+      )}
+      <div className="mock-notice">
+        <FlaskConical size={17} />
+        <span>
+          <strong>
+            {mode === "mock"
+              ? "Đang thử quy trình với dữ liệu mẫu."
+              : mode === "both"
+                ? "Đang dùng trình duyệt riêng cho Douyin và Xiaohongshu."
+                : mode === "douyin"
+                  ? "Đang dùng trình duyệt Douyin riêng."
+                  : "Đang dùng trình duyệt Xiaohongshu riêng."}
+          </strong>{" "}
+          {mode === "mock"
+            ? "Dữ liệu mẫu để thử nghiệm quy trình tìm kiếm offline."
+            : "Dữ liệu trích xuất trực tiếp từ nền tảng thật."}
+        </span>
+      </div>
+      <ErrorBanner message={error || job.error} />
+      {(busy || active || job.data) && (
+        <section className="job-progress" aria-live="polite">
+          <div className="progress-top">
+            <div className="row">
+              {job.data?.status === "completed" ? (
+                <Check size={18} />
+              ) : (
+                <Clock3 size={18} />
+              )}
+              <strong>
+                {job.data
+                  ? statusName[job.data.status] ?? job.data.status
+                  : "Đang khởi tạo lượt tìm kiếm…"}
+              </strong>
+              <span className="muted">{job.data?.original_query ?? query}</span>
+            </div>
+            {active && (
+              <Button size="sm" variant="outline" onClick={cancel}>
+                <X size={14} />
+                Hủy tìm kiếm
+              </Button>
+            )}
+          </div>
+          <div className="progress-track">
+            <div
+              style={{
+                transform: `scaleX(${(!job.data ? 15 : terminal.includes(job.data.status) ? 100 : Math.min(95, 8 + ((job.data.processed_count ?? 0) / (job.data.requested_limit || 1)) * 87)) / 100})`,
+              }}
+            />
+          </div>
+          {job.data && (
+            <div className="progress-meta">
+              <span>
+                Đã lưu: <strong>{job.data.processed_count ?? 0}</strong> / {job.data.requested_limit ?? 0} video
+              </span>
+              <span>
+                Đã quét: {job.data.found_count ?? 0} thẻ
+              </span>
+              <span>
+                Bị loại trừ: <strong style={{ color: "#b91c1c" }}>{job.data.rejected_count ?? 0}</strong> video
+              </span>
+              <span>
+                Douyin: {job.data.provider_counts?.douyin ?? 0} · RED:{" "}
+                {job.data.provider_counts?.xiaohongshu ?? 0}
+              </span>
+              <span>{job.data.duplicate_count ?? 0} video trùng</span>
+            </div>
+          )}
+          {job.data && job.data.status === "completed" && job.data.processed_count < job.data.requested_limit && (
+            <p className="muted" style={{ fontSize: "0.83rem", marginTop: "0.4rem" }}>
+              ℹ️ Đã lưu {job.data.processed_count}/{job.data.requested_limit} video trong phạm vi lượt quét này. Các ứng viên không đủ độ phù hợp đã bị loại; chưa khẳng định đã quét hết kết quả của nền tảng.
+            </p>
+          )}
+          {job.data && (job.data.ai_source || job.data.actual_ai_model) && (
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.4rem", flexWrap: "wrap" }}>
+              <span className="muted" style={{ fontSize: "0.82rem" }}>Nguồn dịch:</span>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.3rem",
+                  fontSize: "0.78rem",
+                  padding: "0.15rem 0.5rem",
+                  borderRadius: "999px",
+                  background: job.data.actual_ai_model || job.data.ai_source === "gemini" ? "#eff6ff" : "#f0fdf4",
+                  color: job.data.actual_ai_model || job.data.ai_source === "gemini" ? "#1d4ed8" : "#15803d",
+                  border: `1px solid ${job.data.actual_ai_model || job.data.ai_source === "gemini" ? "#bfdbfe" : "#bbf7d0"}`,
+                  fontWeight: 600,
+                }}
+              >
+                {job.data.actual_ai_model
+                  ? `Gemini AI: ${job.data.actual_ai_model}${job.data.ai_fallback_occurred ? " (fallback)" : ""}`
+                  : job.data.ai_source === "dictionary"
+                  ? "Từ điển chuyên ngành"
+                  : job.data.ai_source === "original"
+                  ? "Query gốc"
+                  : "Từ điển / Fallback"}
+                {typeof job.data.ai_latency_ms === "number" && (
+                  <span style={{ opacity: 0.75, fontWeight: 400 }}>({Math.round(job.data.ai_latency_ms)}ms)</span>
+                )}
+              </span>
+            </div>
+          )}
+          {job.data && job.data.queries?.length > 0 && (
+            <p className="job-queries" style={{ marginTop: "0.4rem" }}>
+              Truy vấn thực tế gửi nền tảng:{" "}
+              {job.data.queries.map((q, i) => (
+                <span key={i} style={{ display: "inline-block", background: "#f1f5f9", padding: "0.1rem 0.45rem", borderRadius: "4px", margin: "0 0.2rem", fontWeight: 500, fontSize: "0.82rem" }}>
+                  {q}
+                </span>
+              ))}
+            </p>
+          )}
+          {job.data?.diagnostics?.rejected_candidates && job.data.diagnostics.rejected_candidates.length > 0 && (
+            <details style={{ marginTop: "0.6rem", border: "1px solid #fed7aa", borderRadius: "8px", background: "#fff7ed", padding: "0.5rem 0.75rem" }}>
+              <summary style={{ cursor: "pointer", fontWeight: 600, color: "#c2410c", fontSize: "0.85rem" }}>
+                🛡️ Ứng viên bị lọc: {job.data.rejected_count ?? 0} · Hiển thị {job.data.diagnostics.rejected_candidates.length} lý do đầu tiên
+              </summary>
+              <div style={{ marginTop: "0.5rem", maxHeight: "200px", overflowY: "auto", fontSize: "0.8rem" }}>
+                {job.data.diagnostics.rejected_candidates.map((cand, idx) => (
+                  <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0.3rem 0", borderBottom: "1px dashed #fdba74", gap: "0.5rem" }}>
+                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={cand.title}>
+                      [{cand.platform === "douyin" ? "Douyin" : "RED"}] {cand.title}
+                    </span>
+                    <span style={{ color: "#9a3412", fontWeight: 500, fontSize: "0.78rem", whiteSpace: "nowrap" }}>
+                      {cand.reason}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+          <ErrorBanner message={job.data?.ai_warning ?? ""} />
+          {job.data?.diagnostics?.provider_errors && !terminal.includes(job.data.status) && (
+            <div className="error-banner" role="status">
+              {Object.entries(job.data.diagnostics.provider_errors).map(([platform, message]) => (
+                <p key={platform}>
+                  {platformName(platform)} chưa tìm được trong lượt này: {message}. Kết quả từ nền tảng còn lại vẫn được giữ.
+                </p>
+              ))}
+            </div>
+          )}
+          <ErrorBanner message={job.data?.error_message ?? ""} />
+          {job.data &&
+            ["waiting_for_login", "waiting_for_user"].includes(
+              job.data.status,
+            ) && (() => {
+              const jobPlatform =
+                (job.data?.active_platform as string) ||
+                (job.data?.platforms && job.data.platforms[0]) ||
+                (mode === "douyin" ? "douyin" : "xiaohongshu");
+              const jobPlatformLabel =
+                jobPlatform === "douyin" ? "Douyin" : "Xiaohongshu";
+              const isLogin = job.data.status === "waiting_for_login";
+
+              return (
+                <div
+                  style={{
+                    margin: "1rem 0",
+                    padding: "1.25rem",
+                    background: "#f0fdfa",
+                    border: "2px solid #0f766e",
+                    borderRadius: "10px",
+                    boxShadow: "0 4px 16px rgba(15, 118, 110, 0.1)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      flexWrap: "wrap",
+                      gap: "0.5rem",
+                      marginBottom: "0.6rem",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "0.5rem",
+                        color: "#0f766e",
+                        fontWeight: 700,
+                        fontSize: "1.05rem",
+                      }}
+                    >
+                      <span>
+                        {isLogin
+                          ? `🔐 Nền tảng ${jobPlatformLabel} yêu cầu đăng nhập tài khoản`
+                          : `⚠️ Nền tảng ${jobPlatformLabel} yêu cầu xác minh bảo mật`}
+                      </span>
+                    </div>
+                  </div>
+                  <p
+                    style={{
+                      color: "#134e4a",
+                      fontSize: "0.88rem",
+                      lineHeight: 1.5,
+                      marginBottom: "0.75rem",
+                    }}
+                  >
+                    {isLogin ? (
+                      <>
+                        Nền tảng <strong>{jobPlatformLabel}</strong> yêu cầu đăng nhập tài khoản. Vui lòng bấm <strong>Mở cửa sổ {jobPlatformLabel}</strong> hoặc <strong>Đăng nhập bằng mã QR</strong> để đăng nhập trực tiếp trên trình duyệt của công cụ.
+                      </>
+                    ) : (
+                      <>
+                        Nền tảng <strong>{jobPlatformLabel}</strong> yêu cầu giải mã thử thách bảo mật (CAPTCHA). Vui lòng bấm <strong>Mở cửa sổ {jobPlatformLabel}</strong> để hoàn thành xác minh trực tiếp.
+                      </>
+                    )}
+                  </p>
+                  <BrowserControls
+                    jobId={job.data.id}
+                    waiting
+                    refresh={job.refresh}
+                    platform={
+                      jobPlatform === "douyin" ? "douyin" : "xiaohongshu"
+                    }
+                  />
+                </div>
+              );
+            })()}
+        </section>
+      )}
+      {jobId ? (
+        <VideoGrid
+          key={jobId}
+          jobId={jobId}
+          initialSort={mapSortByToGridSort(sortBy)}
+          pollIntervalMs={active ? 1000 : 0}
+        />
+      ) : (
+        <>
+          <div className="section-heading">
+            <h2>Tìm kiếm gần đây</h2>
+            <Link href="/history" className="text-link">
+              Xem lịch sử
+              <ArrowRight size={15} />
+            </Link>
+          </div>
+          {recent.data?.items.length ? (
+            <div className="recent-grid">
+              {recent.data.items.slice(0, 3).map((item) => (
+                <button
+                  className="recent-card"
+                  key={item.id}
+                  onClick={() => {
+                    if (item.import_source) {
+                      router.push(`/imports/${item.id}`);
+                      return;
+                    }
+                    const itemPlatform =
+                      (item.platforms && item.platforms[0]) || "xiaohongshu";
+                    setMode(item.is_mock ? "mock" : item.platforms?.length === 2 ? "both" : parseSearchMode(itemPlatform));
+                    setJobId(item.id);
+                    setQuery(item.original_query);
+                  }}
+                >
+                  <span>
+                    <Clock3 size={17} />
+                    {new Date(item.created_at).toLocaleDateString("vi-VN")}
+                  </span>
+                  <strong>{item.original_query}</strong>
+                  <span>
+                    {item.processed_count} video · {statusName[item.status]}
+                    <ArrowRight size={16} />
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="first-search">
+              <div className="first-icon">
+                <Search size={27} />
+              </div>
+              <h3>Khám phá đầu tiên của bạn</h3>
+              <p>
+                Nhập một chủ đề ở trên để thử tìm kiếm.
+                <br />
+                Sau đó lưu những video bạn muốn xem lại vào Thư viện.
+              </p>
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+}

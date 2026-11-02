@@ -1,0 +1,243 @@
+"""Session Keep-Alive Service.
+
+Periodically checks active sessions without navigating away from searches.
+Only the platform server controls expiry and security challenges.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
+from backend.core.config import ROOT
+
+logger = logging.getLogger("session.keeper")
+
+
+class SessionKeepAliveService:
+    def __init__(
+        self,
+        douyin_profile: Path | None = None,
+        xhs_profile: Path | None = None,
+        heartbeat_interval_seconds: float = 21600.0,  # 6 hours default
+        douyin_browser: Any | None = None,
+        xhs_browser: Any | None = None,
+    ):
+        self.douyin_profile = douyin_profile or (ROOT / "data" / "browser" / "douyin")
+        self.xhs_profile = xhs_profile or (ROOT / "data" / "browser" / "xiaohongshu")
+        self.heartbeat_interval = heartbeat_interval_seconds
+        self.browsers: dict[str, Any] = {
+            "douyin": douyin_browser,
+            "xiaohongshu": xhs_browser,
+        }
+        self.last_heartbeat: dict[str, float] = {}
+        self.status: dict[str, dict[str, Any]] = {
+            "douyin": {"active": False, "cookie_count": 0, "last_ping": None, "state": "idle"},
+            "xiaohongshu": {"active": False, "cookie_count": 0, "last_ping": None, "state": "idle"},
+        }
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
+
+    def register_browser(self, platform: str, browser_service: Any) -> None:
+        self.browsers[platform] = browser_service
+
+    def inspect_saved_cookies(self, platform: str) -> list[dict[str, Any]]:
+        profile = self.douyin_profile if platform == "douyin" else self.xhs_profile
+        auth_file = profile / "auth_state.json"
+        if not auth_file.is_file():
+            return []
+        try:
+            data = json.loads(auth_file.read_text(encoding="utf-8"))
+            cookies = data.get("cookies", [])
+            if isinstance(cookies, list):
+                return cookies
+        except Exception as exc:
+            logger.warning("Failed reading auth_state for %s: %s", platform, exc)
+        return []
+
+    def get_status(self) -> dict[str, Any]:
+        now = time.time()
+        res: dict[str, Any] = {}
+        for p in ("douyin", "xiaohongshu"):
+            cookies = self.inspect_saved_cookies(p)
+            has_tokens = any(
+                c.get("name") in ("sessionid", "passport_csrf_token", "web_session", "id_token")
+                for c in cookies
+            )
+            last_p = self.last_heartbeat.get(p)
+            browser = self.browsers.get(p)
+            page = getattr(browser, "page", None)
+            has_auth = bool(
+                page and not page.is_closed()
+                and getattr(browser, "state", None) == "authenticated"
+            )
+            res[p] = {
+                "saved_cookies": len(cookies),
+                "has_saved_session_tokens": has_tokens,
+                "has_auth_session": has_auth,
+                "last_heartbeat_s_ago": round(now - last_p, 1) if last_p else None,
+                "status": "healthy" if has_auth else ("saved_unverified" if has_tokens else "unauthenticated"),
+            }
+        return res
+
+    def record_activity(self, platform: str) -> None:
+        """Record activity timestamp for an active authenticated session."""
+        self.last_heartbeat[platform] = time.time()
+
+    async def ping_platform(self, platform: str, browser_service: Any = None) -> bool:
+        """Sends a lightweight ping to keep cookies fresh if browser service is available and not busy."""
+        if not browser_service:
+            logger.debug("No browser service available for %s ping", platform)
+            return False
+
+        if hasattr(browser_service, "lock") and browser_service.lock.locked():
+            logger.debug("Skipping session ping for %s: browser is currently busy", platform)
+            if getattr(browser_service, "state", None) == "authenticated":
+                self.last_heartbeat[platform] = time.time()
+                return True
+            return False
+
+        from urllib.parse import urlsplit
+
+        from backend.services.browser_session import (
+            platform_navigation_url,
+            save_session_checkpoint,
+        )
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                async with browser_service.lock:
+                    if getattr(browser_service, "page", None) is None:
+                        return False
+                    page = (
+                        browser_service.get_active_page()
+                        if hasattr(browser_service, "get_active_page")
+                        else getattr(browser_service, "page", None)
+                    )
+                    if not page or page.is_closed():
+                        return False
+                    # Do not touch the platform while a user is verifying a challenge.
+                    if getattr(browser_service, "state", None) in {
+                        "login_required", "verification_required", "restricted", "network_error",
+                    }:
+                        return False
+                    domains = ("douyin.com",) if platform == "douyin" else ("xiaohongshu.com", "rednote.com")
+                    verified_url = platform_navigation_url(page.url, domains)
+                    if not verified_url:
+                        return False
+                    target = urlsplit(verified_url)
+                    target_url = f"{target.scheme}://{target.netloc}/"
+
+                    ping_res = await page.evaluate(
+                        """async (targetUrl) => {
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 8000);
+                            try {
+                                const res = await fetch(targetUrl, {
+                                    method: 'HEAD',
+                                    signal: controller.signal,
+                                    credentials: 'include'
+                                });
+                                clearTimeout(timeoutId);
+                                return {
+                                    ok: res.ok || (res.status >= 200 && res.status < 400),
+                                    status: res.status
+                                };
+                            } catch (e) {
+                                clearTimeout(timeoutId);
+                                return { ok: false, error: String(e), status: 0 };
+                            }
+                        }""",
+                        target_url,
+                    )
+
+                    if isinstance(ping_res, dict) and ping_res.get("ok"):
+                        login_ok = False
+                        if hasattr(browser_service, "inspect"):
+                            login_ok = await browser_service.inspect(page) == "authenticated"
+
+                        if login_ok:
+                            if getattr(browser_service, "context", None) and getattr(browser_service, "profile", None):
+                                await save_session_checkpoint(browser_service.context, browser_service.profile)
+                            self.last_heartbeat[platform] = time.time()
+                            logger.info(
+                                "Session heartbeat succeeded for %s (status=%s)",
+                                platform,
+                                ping_res.get("status"),
+                            )
+                            return True
+                        else:
+                            logger.warning("Session heartbeat failed for %s: user session logged out", platform)
+                            return False
+                    else:
+                        logger.warning(
+                            "Session heartbeat ping returned unsuccessful status for %s (attempt %d/%d): %s",
+                            platform,
+                            attempt + 1,
+                            max_retries,
+                            ping_res,
+                        )
+            except Exception as err:
+                logger.warning(
+                    "Session heartbeat error for %s (attempt %d/%d): %s",
+                    platform,
+                    attempt + 1,
+                    max_retries,
+                    err,
+                )
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.0)
+
+        return False
+
+    async def _heartbeat_loop(self) -> None:
+        while self._running:
+            try:
+                for platform, browser in list(self.browsers.items()):
+                    if not self._running:
+                        break
+                    cookies = self.inspect_saved_cookies(platform)
+                    if not cookies:
+                        continue
+
+                    if browser and hasattr(browser, "lock") and browser.lock.locked():
+                        logger.debug("Browser for %s is busy, skipping heartbeat this cycle", platform)
+                        continue
+
+                    try:
+                        await self.ping_platform(platform, browser)
+                    except Exception as err:
+                        logger.warning("Session heartbeat error for %s: %s", platform, err)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Error in session keeper heartbeat loop: %s", exc)
+
+            sleep_remaining = self.heartbeat_interval
+            while self._running and sleep_remaining > 0:
+                step = min(sleep_remaining, 1.0)
+                await asyncio.sleep(step)
+                sleep_remaining -= step
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._heartbeat_loop())
+        logger.info("SessionKeepAliveService started with %s interval", self.heartbeat_interval)
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        logger.info("SessionKeepAliveService stopped")

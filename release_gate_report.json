@@ -1,0 +1,170 @@
+{
+  "verdict": "REJECTED (RED)",
+  "duration_seconds": 384.77,
+  "timestamp": "2026-10-13T14:27:18Z",
+  "strict_live_run": {
+    "executed": true,
+    "command": "python scripts/release_gate.py --live --require-live",
+    "exit_code": 2,
+    "timestamp": "2026-10-05T17:31:56Z",
+    "current_run_live_captures": 0,
+    "capture_provenance_audit": {
+      "current_run_live_captures": 0,
+      "current_run_unverified_capture_records": 0,
+      "manifest_records_in_run_scope": 0,
+      "all_retrieved_results_verified": false,
+      "platforms": {
+        "douyin": {
+          "retrieval_status": "BLOCKED (CHALLENGE_REQUIRED)",
+          "expected_results": 0,
+          "manifest_records": 0,
+          "verified_records": 0,
+          "complete": false
+        },
+        "xiaohongshu": {
+          "retrieval_status": "BLOCKED (LOGIN_REQUIRED)",
+          "expected_results": 0,
+          "manifest_records": 0,
+          "verified_records": 0,
+          "complete": false
+        }
+      }
+    },
+    "query": "nh\u00edp g\u1eafp sticker",
+    "submitted_query": "\u8d34\u7eb8\u954a\u5b50",
+    "douyin": {
+      "status": "BLOCKED (CHALLENGE_REQUIRED)",
+      "network_reachable": false,
+      "browser_reachable": false,
+      "retrieval_available": false,
+      "retrieval_block_reason": "CAPTCHA_CHALLENGE",
+      "precision_verified": false,
+      "results_count": 0,
+      "reason": "CAPTCHA or slider challenge encountered during live search"
+    },
+    "xiaohongshu": {
+      "status": "BLOCKED (LOGIN_REQUIRED)",
+      "network_reachable": false,
+      "browser_reachable": false,
+      "retrieval_available": false,
+      "retrieval_block_reason": "LOGIN_REQUIRED",
+      "precision_verified": false,
+      "results_count": 0,
+      "reason": "User login session required to view search results on workstation"
+    }
+  },
+  "stages": {
+    "1_environment": {
+      "passed": true,
+      "detail": "Python 3.12.14 verified",
+      "duration_s": 0.0
+    },
+    "2_database": {
+      "passed": true,
+      "detail": "SQLite database schema verified (5 core tables present)",
+      "duration_s": 0.62
+    },
+    "3_ruff_linter": {
+      "passed": true,
+      "exit_code": 0,
+      "duration_s": 0.27
+    },
+    "4_mypy_types": {
+      "passed": true,
+      "exit_code": 0,
+      "duration_s": 1.18
+    },
+    "5_frontend_eslint": {
+      "passed": true,
+      "exit_code": 0,
+      "duration_s": 71.78
+    },
+    "6_frontend_typecheck": {
+      "passed": true,
+      "exit_code": 0,
+      "duration_s": 4.77
+    },
+    "7_frontend_build": {
+      "passed": true,
+      "exit_code": 0,
+      "duration_s": 35.7
+    },
+    "8_backend_pytest": {
+      "passed": true,
+      "exit_code": 0,
+      "tests_passed": 569,
+      "tests_failed": 0,
+      "tests_skipped": 3,
+      "duration_s": 158.75
+    },
+    "9_fixture_benchmark": {
+      "passed": true,
+      "exit_code": 0,
+      "dataset_status": "REGRESSION FIXTURE",
+      "queries_verified": 64,
+      "domain_benchmark_queries": 60,
+      "real_crawled_queries": 4,
+      "total_samples_audited": 33,
+      "schema_valid": true,
+      "schema_valid_samples": 33,
+      "metadata_schema_valid": 33,
+      "manifest_verified": false,
+      "manifest_verified_samples": 0,
+      "annotation_verified": false,
+      "annotation_verified_samples": 0,
+      "unverified_samples": 33,
+      "rejected_samples": 0,
+      "source_provenance_verified": false,
+      "provenance_audit_level": "schema_contract_only_unverified_fixtures",
+      "manifest_storage": {
+        "path": "data/manifests/live_capture_manifest.jsonl",
+        "type": "append_only_jsonl",
+        "historical_records_count": 218,
+        "historical_unverified_records_count": 218,
+        "historical_suspected_synthetic_records_count": 60,
+        "historical_quarantined_records_count": 60,
+        "historical_quarantine_mode": "logical_only_read_only",
+        "historical_status": "UNVERIFIED_HISTORY_REQUIRES_REVIEW",
+        "current_run_live_captures": 0,
+        "current_run_status": "NOT_RUN",
+        "current_run_unverified_capture_records": 0,
+        "current_run_manifest_isolated": true,
+        "append_only_enforcement": "application_append_mode_only",
+        "tamper_evident": false,
+        "guarantee_level": "metadata_hash_consistency_only; edits/deletion require external signature or immutable storage to detect"
+      },
+      "real_crawled_samples_provenance": 20,
+      "independent_holdout_samples": 13,
+      "crawled_video_samples": 16,
+      "crawled_image_text_samples": 4,
+      "crawled_platforms": {
+        "douyin": {
+          "video": 16,
+          "image_text": 4,
+          "total": 20
+        },
+        "xiaohongshu": {
+          "video": 0,
+          "image_text": 0,
+          "total": 0,
+          "status": "PENDING DATA (awaiting live crawl on workstation)"
+        }
+      },
+      "test_suites_passed": 12,
+      "duration_s": 4.75
+    },
+    "10_frontend_playwright_e2e": {
+      "passed": false,
+      "exit_code": 1,
+      "tests_passed": 27,
+      "specs_count": 8,
+      "duration_s": 106.79
+    },
+    "11_live_crawl_acceptance": {
+      "executed": false,
+      "passed": null,
+      "workstation_operational": null,
+      "detail": "Skipped (Pass --live or set LIVE_CRAWL_ENABLED=1 to execute live network verification)"
+    }
+  }
+}
